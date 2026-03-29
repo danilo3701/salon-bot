@@ -2,6 +2,7 @@
 
 > Production Telegram bot for booking nail appointments, managing schedules, and automating client communications — deployed for a real salon in St. Petersburg.
 
+[![CI](https://github.com/pavel-ai-dev/salon-bot-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/pavel-ai-dev/salon-bot-ai/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.11-blue)](https://python.org)
 [![PTB](https://img.shields.io/badge/python--telegram--bot-21.x-green)](https://python-telegram-bot.org)
 [![Tests](https://img.shields.io/badge/Tests-30%2F30-brightgreen)](tests/)
