@@ -1,0 +1,15 @@
+[Unit]
+Description=Salon Bot v14
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/v14
+ExecStart=/usr/bin/python3 /root/v14/main.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

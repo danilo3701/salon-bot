@@ -1,0 +1,1203 @@
+"""
+app/bot/handlers/master.py  — v13
+
+Панель мастера. Все переходы через edit_or_reply (плавно, без добавления сообщений).
+Календарь унифицирован с клиентом (build_calendar_buttons).
+Расписание — аккуратная сетка 2 кнопки в ряд.
+"""
+from __future__ import annotations
+
+import logging
+
+from telegram import Update
+from telegram.ext import CallbackContext
+
+from app.bot.helpers import (
+    set_step,
+    K_BAN, K_BOOKING, K_CLIENT, K_DISPATCH, K_NOTE, K_PORTFOLIO, K_REVIEW, K_SERVICE,
+    back_master, build_calendar_buttons, build_calendar_grid_master, edit_or_reply, fmt_booking, kb,
+    plural, safe_reply, safe_send, stars, svc, uid_uname,
+)
+from app.core.settings import settings
+from app.core.time_utils import fmt_date, fmt_slot, local_today
+from app.models.domain import BookingStatus
+
+logger = logging.getLogger("salon.master")
+
+_SIGN = f"\n\n— {settings.MASTER_USERNAME}"
+
+
+def register_steps(dispatcher):
+    dispatcher.register("master_note",    _step_note)
+    dispatcher.register("import_clients", _step_import_clients)
+    dispatcher.register("srv_add_name",   _step_srv_add_name)
+    dispatcher.register("srv_add_price",  _step_srv_add_price)
+    dispatcher.register("srv_edit_price", _step_srv_edit_price)
+    dispatcher.register("srv_rename",     _step_srv_rename)
+    dispatcher.register("about_bio",      _step_about_bio)
+    dispatcher.register("about_address",  _step_about_address)
+    dispatcher.register("about_contact",  _step_about_contact)
+    dispatcher.register("slot_add_start", _step_slot_start)
+    dispatcher.register("slot_add_end",   _step_slot_end)
+    dispatcher.register("about_photo",    _step_about_photo)
+    dispatcher.register("portfolio_add",  _step_portfolio_add)
+
+
+K_TIMESLOT = "svc_timeslot"
+
+
+def _tsvc(context):
+    return svc(context, K_TIMESLOT)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# ГЛАВНОЕ МЕНЮ МАСТЕРА
+# ════════════════════════════════════════════════════════════════════════════════
+
+async def show_master_menu(update: Update, context: CallbackContext):
+    if update.callback_query:
+        await update.callback_query.answer()
+    from app.core.time_utils import local_now
+    now      = local_now()
+    _months = ["января","февраля","марта","апреля","мая","июня",
+                 "июля","августа","сентября","октября","ноября","декабря"]
+    now_str  = f"{now.day} {_months[now.month-1]}, {now.strftime('%H:%M')}"
+    # Убираем ведущий ноль у числа месяца
+    await edit_or_reply(
+        update,
+        f"👑 <b>Панель мастера</b>\n📅 {now_str}",
+        kb([
+            ("📋 Сегодня",       "adm_today"),
+            ("📅 Календарь",     "adm_calendar"),
+            ("👥 Клиенты",       "adm_crm"),
+            ("⭐ Отзывы",        "adm_reviews"),
+            ("📊 Статистика",    "adm_stats"),
+            ("💅 Услуги",        "adm_services"),
+            ("⏰ Расписание",    "adm_schedule"),
+            ("📸 Портфолио",     "adm_portfolio"),
+            ("👩‍🎨 О мастере",     "adm_about"),
+            ("📨 Пригласить",    "adm_invite"),
+            ("🚫 Чёрный список", "adm_blacklist"),
+        ], cols=2),
+    )
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# ЗАПИСИ СЕГОДНЯ
+# ════════════════════════════════════════════════════════════════════════════════
+
+async def adm_today(update: Update, context: CallbackContext):
+    """Записи на сегодня: список текстом + кнопка на каждую запись. Только кнопка Назад."""
+    await update.callback_query.answer()
+    today_str = local_today().isoformat()
+    rows      = svc(context, K_BOOKING).by_date(today_str)
+
+    if not rows:
+        await edit_or_reply(update,
+            f"📋 <b>Сегодня, {fmt_date(today_str)}</b>\n\nЗаписей нет.",
+            kb([("◀️ Назад", "master_menu")]))
+        return
+
+    lines = [f"📋 <b>Сегодня, {fmt_date(today_str)}</b>\n"]
+    buttons = []
+    for b in rows:
+        client = svc(context, K_CLIENT).get(b.user_id)
+        name   = client.display_name if client else "—"
+        phone  = client.phone        if client else "—"
+        lines.append(
+            f"⏰ <b>{fmt_slot(b.time)}</b>  👤 {name}  📞 {phone}\n"
+            f"   💅 {b.service}\n"
+        )
+        buttons.append((f"⏰ {fmt_slot(b.time)} — {name}", f"adm_cancel_{b.id}"))
+
+    await edit_or_reply(update,
+        "\n".join(lines),
+        kb(buttons + [("◀️ Назад", "master_menu")]))
+
+
+async def _show_day(update, context, date_str: str,
+                    back_label: str = "◀️ Календарь",
+                    back_cb:    str = "adm_calendar"):
+    """Единый рендер дня: слоты + управление."""
+    day_info = svc(context, K_BOOKING).slots_for_day(date_str)
+    rows     = svc(context, K_BOOKING).by_date(date_str)
+
+    lines   = [f"📅 <b>{fmt_date(date_str)}</b>\n"]
+    buttons = []
+
+    if day_info["day_blocked"]:
+        lines.append("🚫 <i>День полностью закрыт</i>\n")
+        buttons.append(("✅ Открыть весь день", f"adm_day_open_{date_str}"))
+    else:
+        for slot_info in day_info["slots"]:
+            slot    = slot_info["time"]
+            status  = slot_info["status"]
+            booking = next((b for b in rows if b.time == slot), None)
+
+            if status == "booked" and booking:
+                client = svc(context, K_CLIENT).get(booking.user_id)
+                name   = client.display_name if client else "—"
+                phone  = client.phone        if client else "—"
+                lines.append(
+                    f"⏰ <b>{fmt_slot(slot)}</b>\n"
+                    f"   👤 {name}  📞 {phone}\n"
+                    f"   💅 {booking.service}\n"
+                )
+                buttons.append((f"❌ Отменить {slot}", f"adm_cancel_{booking.id}"))
+            elif status == "blocked":
+                lines.append(f"🔒 {fmt_slot(slot)}  —  закрыт\n")
+                buttons.append((f"🔓 Открыть {slot}", f"adm_slot_on_{date_str}_{slot}"))
+            else:
+                lines.append(f"✅ {fmt_slot(slot)}  —  свободно\n")
+                buttons.append((f"🔒 Закрыть {slot}", f"adm_slot_off_{date_str}_{slot}"))
+
+        buttons.append((f"🚫 Закрыть весь день", f"adm_day_close_{date_str}"))
+
+    msg = "\n".join(lines)
+    await edit_or_reply(update, msg, kb(buttons + [(back_label, back_cb)]))
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# ОТМЕНА ЗАПИСИ МАСТЕРОМ
+# ════════════════════════════════════════════════════════════════════════════════
+
+async def adm_cancel_booking(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    bid    = int(update.callback_query.data.replace("adm_cancel_", ""))
+    b      = svc(context, K_BOOKING).get(bid)
+    if not b:
+        await edit_or_reply(update, "Запись не найдена.", kb(back_master()))
+        return
+    client = svc(context, K_CLIENT).get(b.user_id)
+    name   = client.display_name if client else "—"
+    await edit_or_reply(update,
+        f"Отменить запись <b>{name}</b>?\n\n{fmt_booking(b)}",
+        kb([
+            ("✅ Да, отменить", f"adm_cancel_yes_{bid}"),
+            ("◀️ Назад",        f"calday_{b.date}"),
+        ]))
+
+
+async def adm_cancel_confirmed(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    bid    = int(update.callback_query.data.replace("adm_cancel_yes_", ""))
+    uid, _ = uid_uname(update)
+    result = svc(context, K_BOOKING).cancel(bid, uid)
+    if not result.ok:
+        await edit_or_reply(update, f"⚠️ {result.error}", kb(back_master()))
+        return
+    b      = result.booking
+    client = svc(context, K_CLIENT).get(b.user_id)
+    name   = client.display_name if client else "—"
+    await edit_or_reply(update,
+        f"✅ Запись {name} на {fmt_slot(b.time)} отменена.",
+        kb([(f"◀️ {fmt_date(b.date)}", f"calday_{b.date}")] + back_master()))
+    await safe_send(context.bot, b.user_id,
+        f"❌ Ваша запись отменена мастером.\n\n"
+        f"{fmt_booking(b)}\n\n"
+        f"По вопросам: {settings.MASTER_USERNAME}",
+        kb([("📅 Записаться заново", "book_service")]))
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# КАЛЕНДАРЬ МАСТЕРА — унифицирован с клиентом
+# ════════════════════════════════════════════════════════════════════════════════
+
+async def adm_calendar(update: Update, context: CallbackContext,
+                       week_offset: int = 0):
+    await update.callback_query.answer()
+
+    calendar_all = svc(context, K_BOOKING).calendar(days=60)
+
+    markup, week_header = build_calendar_grid_master(
+        all_dates       = calendar_all,
+        prefix          = "calday_",
+        week_offset     = week_offset,
+        week_nav_prefix = "cal_week_",
+        back_buttons    = back_master(),
+    )
+
+    nl = chr(10)
+    legend = (
+        week_header + nl + nl
+        + "🟢 свободен  🟡 частично  🔴 полный  🚫 закрыт" + nl + nl
+        + "Нажмите на день для просмотра"
+    )
+
+    await edit_or_reply(update, legend, markup)
+
+
+async def adm_calendar_week(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    offset = int(update.callback_query.data.replace("cal_week_", ""))
+    await adm_calendar(update, context, week_offset=offset)
+
+
+async def adm_calendar_day(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    date_str = update.callback_query.data.replace("calday_", "")
+    await _show_day(update, context, date_str)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# ПЕРЕНОС — мастер подтверждает / отклоняет
+# ════════════════════════════════════════════════════════════════════════════════
+
+async def adm_rconfirm(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    bid    = int(update.callback_query.data.replace("adm_rconfirm_", ""))
+    result = svc(context, K_BOOKING).confirm_reschedule(bid)
+    if not result.ok:
+        await edit_or_reply(update, f"⚠️ {result.error}", kb(back_master()))
+        return
+    b = result.booking
+    await edit_or_reply(update,
+        f"✅ Перенос подтверждён: {fmt_date(b.date)} {fmt_slot(b.time)}",
+        kb(back_master()))
+    await safe_send(context.bot, b.user_id,
+        f"✅ Мастер подтвердил перенос!\n\n{fmt_booking(b)}{_SIGN}")
+
+
+async def adm_rdecline(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    bid = int(update.callback_query.data.replace("adm_rdecline_", ""))
+    b   = svc(context, K_BOOKING).get(bid)
+    svc(context, K_BOOKING).decline_reschedule(bid)
+    await edit_or_reply(update, "❌ Перенос отклонён.", kb(back_master()))
+    if b:
+        await safe_send(context.bot, b.user_id,
+            f"❌ Мастер не смог перенести запись.\n\n"
+            f"Ваша запись остаётся: {fmt_date(b.date)} {fmt_slot(b.time)}\n"
+            f"По вопросам: {settings.MASTER_USERNAME}")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# БЛОКИРОВКА ДНЕЙ / СЛОТОВ
+# ════════════════════════════════════════════════════════════════════════════════
+
+async def adm_day_close(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    date_str = update.callback_query.data.replace("adm_day_close_", "")
+    svc(context, K_BOOKING).block_day(date_str)
+    await _show_day(update, context, date_str)
+
+
+async def adm_day_open(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    date_str = update.callback_query.data.replace("adm_day_open_", "")
+    svc(context, K_BOOKING).unblock_day(date_str)
+    await _show_day(update, context, date_str)
+
+
+async def adm_slot_off(update: Update, context: CallbackContext):
+    """Закрыть конкретный слот на конкретный день."""
+    await update.callback_query.answer()
+    # callback: adm_slot_off_2099-10-01_09:00
+    data     = update.callback_query.data.replace("adm_slot_off_", "")
+    date_str = data[:10]
+    time_str = data[11:]
+    svc(context, K_BOOKING).block_slot(date_str, time_str)
+    await _show_day(update, context, date_str)
+
+
+async def adm_slot_on(update: Update, context: CallbackContext):
+    """Открыть конкретный слот на конкретный день."""
+    await update.callback_query.answer()
+    data     = update.callback_query.data.replace("adm_slot_on_", "")
+    date_str = data[:10]
+    time_str = data[11:]
+    svc(context, K_BOOKING).unblock_slot(date_str, time_str)
+    await _show_day(update, context, date_str)
+
+
+# Обратная совместимость (старые callback из кэша кнопок)
+async def adm_block(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    await show_master_menu(update, context)
+
+async def adm_unblock(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    await show_master_menu(update, context)
+
+async def cb_block_day(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    date_str = update.callback_query.data.replace("block_", "")
+    svc(context, K_BOOKING).block_day(date_str)
+    await _show_day(update, context, date_str)
+
+async def cb_unblock(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    date_str = update.callback_query.data.replace("unblock_", "")
+    svc(context, K_BOOKING).unblock_day(date_str)
+    await _show_day(update, context, date_str)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# CRM — КЛИЕНТЫ
+# ════════════════════════════════════════════════════════════════════════════════
+
+async def adm_crm(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    clients = svc(context, K_CLIENT).all_clients()
+    count   = len(clients)
+    buttons = [
+        (f"👤 {c.display_name}  ·  {c.phone or '—'}", f"crm_{c.user_id}")
+        for c in clients
+    ]
+    header = f"👥 <b>Клиенты ({count}):</b>" if count else "👥 <b>Клиентов пока нет</b>"
+    mgmt   = [
+        ("📤 Экспорт", "adm_export_clients"),
+        ("📥 Импорт",  "adm_import_clients"),
+    ]
+    await edit_or_reply(update, header,
+        kb(buttons + mgmt + back_master(), cols=1))
+
+
+async def cb_crm_client(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    target_uid = int(update.callback_query.data.replace("crm_", ""))
+    card       = svc(context, K_CLIENT).card(target_uid)
+    if not card:
+        await edit_or_reply(update, "Клиент не найден.", kb(back_master()))
+        return
+
+    c     = card.client
+    today = local_today().isoformat()
+
+    upcoming  = [b for b in card.bookings if b.status == BookingStatus.ACTIVE and b.date >= today]
+    past      = [b for b in card.bookings
+                 if b.status in (BookingStatus.ACTIVE, BookingStatus.COMPLETED) and b.date < today]
+    cancelled = [b for b in card.bookings if b.status == BookingStatus.CANCELLED]
+
+    text = (
+        f"👤 <b>{c.display_name}</b>\n"
+        f"📞 {c.phone}  |  {c.username or '—'}\n\n"
+        f"Визитов: <b>{card.visits}</b>  ·  "
+        f"Потрачено: <b>{card.total_spent:,} руб.</b>\n"
+        f"Предстоящих: <b>{card.upcoming}</b>  ·  "
+        f"Отмен: {len(cancelled)}\n"
+        f"Последний визит: {fmt_date(card.last_visit) if card.last_visit else '—'}\n"
+    )
+    if upcoming:
+        text += "\n<b>📅 Предстоящие:</b>\n"
+        for b in upcoming:
+            text += f"  {fmt_date(b.date)} {fmt_slot(b.time)} — {b.service}\n"
+    if past:
+        text += "\n<b>📋 Последние визиты:</b>\n"
+        for b in sorted(past, key=lambda x: x.date, reverse=True)[:5]:
+            text += f"  {fmt_date(b.date)} — {b.service} ({b.price:,} руб.)\n"
+    if card.notes:
+        text += "\n<b>📝 Заметки:</b>\n"
+        for n in card.notes[:3]:
+            d = n.created_at.strftime("%d.%m.%Y") if n.created_at else "—"
+            text += f"  [{d}] {n.text}\n"
+    if card.reviews:
+        text += "\n<b>⭐ Отзывы:</b>\n"
+        for r in card.reviews[:3]:
+            d = r.created_at.strftime("%d.%m.%Y") if r.created_at else "—"
+            text += f"  {stars(r.rating)} {d}"
+            if r.text:
+                text += f" — {r.text[:60]}"
+            text += "\n"
+
+    is_banned = svc(context, K_BAN).is_banned(target_uid)
+    ban_btn   = ("✅ Разблокировать", f"adm_unban_{target_uid}") if is_banned \
+                else ("🚫 В чёрный список", f"adm_ban_{target_uid}")
+
+    await edit_or_reply(update, text,
+        kb([
+            ("✏️ Заметка",         f"note_{target_uid}"),
+            ban_btn,
+            ("🗑 Удалить клиента", f"adm_delete_client_{target_uid}"),
+            ("◀️ К клиентам",      "adm_crm"),
+        ], cols=2))
+
+
+async def cb_note_start(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    target = int(update.callback_query.data.replace("note_", ""))
+    context.user_data["note_target"] = target
+    set_step(context.user_data, "master_note")
+    await edit_or_reply(update, "✏️ Введите заметку о клиенте:")
+
+
+async def _step_note(update: Update, context: CallbackContext):
+    target    = context.user_data.pop("note_target", None)
+    author, _ = uid_uname(update)
+    set_step(context.user_data, None)
+    if not target:
+        return
+    svc(context, K_NOTE).add(target, author, update.message.text.strip())
+    await update.message.reply_text(
+        "✅ Заметка сохранена.",
+        reply_markup=kb([(f"◀️ Карточка клиента", f"crm_{target}")] + back_master()))
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# ОТЗЫВЫ
+# ════════════════════════════════════════════════════════════════════════════════
+
+async def adm_reviews(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    reviews = svc(context, K_REVIEW).recent(20)
+    if not reviews:
+        await edit_or_reply(update, "Отзывов пока нет.", kb(back_master()))
+        return
+    text = f"⭐ <b>Последние отзывы ({len(reviews)}):</b>\n\n"
+    for r in reviews:
+        client = svc(context, K_CLIENT).get(r.user_id)
+        name   = client.display_name if client else "Клиент"
+        d      = r.created_at.strftime("%d.%m.%Y") if r.created_at else "—"
+        text  += f"{stars(r.rating)}  <b>{name}</b>  <i>{d}</i>\n"
+        if r.text:
+            text += f"💬 {r.text}\n"
+        if r.photo_file_id:
+            text += "📸 фото прикреплено\n"
+        text += "\n"
+        if len(text) > 3500:
+            text += "..."
+            break
+    await edit_or_reply(update, text, kb(back_master()))
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# СТАТИСТИКА
+# ════════════════════════════════════════════════════════════════════════════════
+
+async def adm_stats(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    s   = svc(context, K_BOOKING).stats()
+    avg = f"{stars(round(s.avg_rating))} {s.avg_rating}" if s.avg_rating else "нет отзывов"
+    await edit_or_reply(update,
+        "\n".join(filter(None, [
+            "📊 <b>Статистика</b>",
+            "",
+            f"👥 Клиентов: <b>{s.unique_clients}</b>",
+            f"📋 Визитов всего: <b>{s.total_bookings}</b>",
+            f"💰 Выручка: <b>{s.total_revenue:,} руб.</b>",
+            (f"💵 Средний чек: <b>{s.total_revenue // s.total_bookings:,} руб.</b>"
+             if s.total_bookings else None),
+            f"❌ Отмен: {s.cancelled}",
+            "",
+            f"📅 <b>{s.month_label}:</b>",
+            f"   Записей: {s.month_bookings}",
+            f"   Выручка: {s.month_revenue:,} руб.",
+            "",
+            f"⭐ Средняя оценка: {avg}",
+        ])),
+        kb(back_master()))
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# УСЛУГИ
+# ════════════════════════════════════════════════════════════════════════════════
+
+async def adm_services(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    services = svc(context, K_SERVICE).all()
+    if not services:
+        await edit_or_reply(update,
+            "💅 <b>Услуги</b>\n\nУслуг пока нет.",
+            kb([("➕ Добавить услугу", "adm_srv_add")] + back_master()))
+        return
+    lines = ["💅 <b>Услуги</b>\n"]
+    for name, price in services.items():
+        lines.append(f"• {name} — <b>{price:,} руб.</b>")
+    text    = "\n".join(lines)
+    buttons = [(f"✏️ {name}", f"adm_srv_edit_{name}") for name in services]
+    buttons.append(("➕ Добавить услугу", "adm_srv_add"))
+    await edit_or_reply(update, text, kb(buttons + back_master()))
+
+
+async def adm_srv_edit(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    name     = update.callback_query.data.replace("adm_srv_edit_", "", 1)
+    services = svc(context, K_SERVICE).all()
+    price    = services.get(name)
+    if price is None:
+        await edit_or_reply(update, "Услуга не найдена.", kb(back_master()))
+        return
+    await edit_or_reply(update,
+        f"✏️ <b>{name}</b> — {price:,} руб.\n\nЧто изменить?",
+        kb([
+            ("💰 Изменить цену", f"adm_srv_price_{name}"),
+            ("🔤 Переименовать", f"adm_srv_rename_{name}"),
+            ("🗑 Удалить",       f"adm_srv_delete_{name}"),
+            ("◀️ К услугам",     "adm_services"),
+        ]))
+
+
+async def adm_srv_add(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    set_step(context.user_data, "srv_add_name")
+    await edit_or_reply(update,
+        "➕ <b>Новая услуга</b>\n\nВведите название услуги:",
+        kb([("◀️ Отмена", "adm_services")]))
+
+
+async def _step_srv_add_name(update: Update, context: CallbackContext):
+    name = update.message.text.strip()
+    if not name:
+        await update.message.reply_text("⚠️ Название не может быть пустым.")
+        return
+    if len(name) > 80:
+        await update.message.reply_text("⚠️ Название слишком длинное (макс. 80 символов).")
+        return
+    set_step(context.user_data, "srv_add_price")
+    context.user_data["srv_new_name"] = name
+    await update.message.reply_text(
+        f"Услуга: <b>{name}</b>\n\nВведите цену (только цифры, руб.):",
+        parse_mode="HTML")
+
+
+async def _step_srv_add_price(update: Update, context: CallbackContext):
+    set_step(context.user_data, None)
+    name = context.user_data.pop("srv_new_name", None)
+    if not name:
+        return
+    raw = update.message.text.strip()
+    if not raw.isdigit():
+        await update.message.reply_text("⚠️ Цена должна быть числом.")
+        return
+    price  = int(raw)
+    ok, err = svc(context, K_SERVICE).add(name, price)
+    if ok:
+        await update.message.reply_text(
+            f"✅ Услуга <b>{name}</b> — {price:,} руб. добавлена.",
+            reply_markup=kb([("◀️ К услугам", "adm_services")] + back_master()),
+            parse_mode="HTML")
+    else:
+        await update.message.reply_text(f"⚠️ {err}",
+            reply_markup=kb([("◀️ К услугам", "adm_services")] + back_master()))
+
+
+async def adm_srv_price(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    name     = update.callback_query.data.replace("adm_srv_price_", "", 1)
+    services = svc(context, K_SERVICE).all()
+    current  = services.get(name, "—")
+    set_step(context.user_data, "srv_edit_price")
+    context.user_data["srv_edit_name"] = name
+    await edit_or_reply(update,
+        f"💰 <b>{name}</b>\nТекущая цена: {current:,} руб.\n\nВведите новую цену:",
+        kb([("◀️ Отмена", f"adm_srv_edit_{name}")]))
+
+
+async def _step_srv_edit_price(update: Update, context: CallbackContext):
+    set_step(context.user_data, None)
+    name = context.user_data.pop("srv_edit_name", None)
+    if not name:
+        return
+    raw = update.message.text.strip()
+    if not raw.isdigit():
+        await update.message.reply_text("⚠️ Введите целое число.")
+        return
+    price  = int(raw)
+    ok, err = svc(context, K_SERVICE).update_price(name, price)
+    if ok:
+        await update.message.reply_text(
+            f"✅ Цена <b>{name}</b> обновлена: {price:,} руб.",
+            reply_markup=kb([("◀️ К услугам", "adm_services")] + back_master()),
+            parse_mode="HTML")
+    else:
+        await update.message.reply_text(f"⚠️ {err}")
+
+
+async def adm_srv_rename(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    name = update.callback_query.data.replace("adm_srv_rename_", "", 1)
+    set_step(context.user_data, "srv_rename")
+    context.user_data["srv_rename_from"] = name
+    await edit_or_reply(update,
+        f"🔤 Переименовать <b>{name}</b>\n\nВведите новое название:",
+        kb([("◀️ Отмена", f"adm_srv_edit_{name}")]))
+
+
+async def _step_srv_rename(update: Update, context: CallbackContext):
+    set_step(context.user_data, None)
+    old_name = context.user_data.pop("srv_rename_from", None)
+    if not old_name:
+        return
+    new_name = update.message.text.strip()
+    if not new_name or len(new_name) > 80:
+        await update.message.reply_text("⚠️ Некорректное название.")
+        return
+    ok, err = svc(context, K_SERVICE).rename(old_name, new_name)
+    if ok:
+        await update.message.reply_text(
+            f"✅ Услуга переименована: <b>{old_name}</b> → <b>{new_name}</b>",
+            reply_markup=kb([("◀️ К услугам", "adm_services")] + back_master()),
+            parse_mode="HTML")
+    else:
+        await update.message.reply_text(f"⚠️ {err}")
+
+
+async def adm_srv_delete(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    name = update.callback_query.data.replace("adm_srv_delete_", "", 1)
+    await edit_or_reply(update,
+        f"🗑 Удалить услугу <b>{name}</b>?\n\n"
+        f"⚠️ Прошлые записи сохранятся, новые на эту услугу будут недоступны.",
+        kb([
+            ("✅ Да, удалить", f"adm_srv_delete_yes_{name}"),
+            ("◀️ Отмена",      f"adm_srv_edit_{name}"),
+        ]))
+
+
+async def adm_srv_delete_yes(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    name   = update.callback_query.data.replace("adm_srv_delete_yes_", "", 1)
+    ok, err = svc(context, K_SERVICE).delete(name)
+    if ok:
+        await edit_or_reply(update,
+            f"✅ Услуга <b>{name}</b> удалена.",
+            kb([("◀️ К услугам", "adm_services")] + back_master()))
+    else:
+        await edit_or_reply(update, f"⚠️ {err}",
+            kb([("◀️ К услугам", "adm_services")] + back_master()))
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# РАСПИСАНИЕ — аккуратная сетка 2 кнопки в ряд (Вкл/Выкл + Удалить)
+# ════════════════════════════════════════════════════════════════════════════════
+
+async def adm_schedule(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    slots = _tsvc(context).all()
+    if not slots:
+        await edit_or_reply(update,
+            "⏰ <b>Расписание</b>\n\nСлотов нет.\n\n"
+            "Добавьте временные слоты — они будут доступны для записи каждый день.",
+            kb([("➕ Добавить слот", "adm_sched_add")] + back_master()))
+        return
+
+    lines   = ["⏰ <b>Расписание рабочих слотов</b>\n"]
+    buttons = []
+    for start, end, active in slots:
+        icon  = "✅" if active else "❌"
+        lines.append(f"{icon} {start}")
+        # Пара кнопок для каждого слота — выводим сеткой 2 в ряд через cols=2
+        toggle_label = f"{'🔕 Выкл' if active else '🔔 Вкл'}  {start}"
+        toggle_cb    = f"adm_sched_toggle_{'off' if active else 'on'}_{start}"
+        buttons.append((toggle_label, toggle_cb))
+        buttons.append((f"🗑 Удалить  {start}", f"adm_sched_del_{start}"))
+
+    buttons.append(("➕ Добавить слот", "adm_sched_add"))
+    await edit_or_reply(update,
+        "\n".join(lines),
+        # cols=2: каждая пара (Вкл/Выкл + Удалить) в одну строку
+        kb(buttons + back_master(), cols=2))
+
+
+async def adm_sched_add(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    set_step(context.user_data, "slot_add_start")
+    await edit_or_reply(update,
+        "➕ <b>Новый слот</b>\n\nВведите время начала (ЧЧ:ММ, например <code>10:00</code>):",
+        kb([("◀️ Отмена", "adm_schedule")]))
+
+
+async def _step_slot_start(update: Update, context: CallbackContext):
+    import re
+    start = update.message.text.strip()
+    if not re.match(r"^\d{2}:\d{2}$", start):
+        await update.message.reply_text("⚠️ Формат: ЧЧ:ММ, например 10:00")
+        return
+    context.user_data["slot_start"] = start
+    set_step(context.user_data, "slot_add_end")
+    await update.message.reply_text(
+        f"Начало: <b>{start}</b>\n\nВведите время окончания (ЧЧ:ММ):",
+        parse_mode="HTML")
+
+
+async def _step_slot_end(update: Update, context: CallbackContext):
+    import re
+    end   = update.message.text.strip()
+    start = context.user_data.pop("slot_start", None)
+    set_step(context.user_data, None)
+    if not start:
+        return
+    if not re.match(r"^\d{2}:\d{2}$", end):
+        await update.message.reply_text("⚠️ Формат: ЧЧ:ММ, например 12:00",
+            reply_markup=kb([("◀️ К расписанию", "adm_schedule")]))
+        return
+    ok, err = _tsvc(context).add(start, end)
+    if ok:
+        await update.message.reply_text(
+            f"✅ Слот <b>{start}–{end}</b> добавлен.",
+            reply_markup=kb([("◀️ К расписанию", "adm_schedule")] + back_master()),
+            parse_mode="HTML")
+    else:
+        await update.message.reply_text(f"⚠️ {err}",
+            reply_markup=kb([("◀️ К расписанию", "adm_schedule")]))
+
+
+async def adm_sched_toggle(update: Update, context: CallbackContext):
+    """Вкл/выкл глобального слота из расписания."""
+    await update.callback_query.answer()
+    data = update.callback_query.data  # adm_sched_toggle_on_HH:MM / _off_HH:MM
+    on   = "_on_" in data
+    # Убираем префикс adm_sched_toggle_on_ или adm_sched_toggle_off_
+    start = data.replace("adm_sched_toggle_on_", "").replace("adm_sched_toggle_off_", "")
+    _tsvc(context).toggle(start, on)
+    # Возвращаемся в расписание плавно
+    await adm_schedule(update, context)
+
+
+async def adm_sched_delete(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    start = update.callback_query.data.replace("adm_sched_del_", "")
+    await edit_or_reply(update,
+        f"🗑 Удалить слот <b>{start}</b>?",
+        kb([
+            ("✅ Да, удалить", f"adm_sched_del_yes_{start}"),
+            ("◀️ Отмена",       "adm_schedule"),
+        ]))
+
+
+async def adm_sched_delete_yes(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    start  = update.callback_query.data.replace("adm_sched_del_yes_", "")
+    ok, err = _tsvc(context).delete(start)
+    if ok:
+        await adm_schedule(update, context)  # плавный возврат в расписание
+    else:
+        await edit_or_reply(update, f"⚠️ {err}",
+            kb([("◀️ К расписанию", "adm_schedule")]))
+
+
+# Обратная совместимость со старыми callback adm_slot_add / adm_slot_del_*
+async def adm_slot_add(update: Update, context: CallbackContext):
+    await adm_sched_add(update, context)
+
+async def adm_slot_toggle(update: Update, context: CallbackContext):
+    """Обратная совместимость: adm_slot_on_HH:MM / adm_slot_off_HH:MM (глобальный слот).
+    Паттерн в main.py: ^adm_slot_o(n|ff)_\\d{2}:\\d{2}$  — только 5-символьное HH:MM.
+    """
+    await update.callback_query.answer()
+    data  = update.callback_query.data
+    on    = data.startswith("adm_slot_on_")
+    # Убираем оба возможных префикса
+    start = data.removeprefix("adm_slot_on_").removeprefix("adm_slot_off_")
+    # Дополнительная проверка: только HH:MM (5 символов), не дата
+    if len(start) == 5 and ":" in start:
+        _tsvc(context).toggle(start, on)
+        await adm_schedule(update, context)
+    else:
+        # Что-то пошло не так — просто обновляем расписание
+        await adm_schedule(update, context)
+
+async def adm_slot_delete(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    start = update.callback_query.data.replace("adm_slot_del_", "")
+    await edit_or_reply(update, f"🗑 Удалить слот <b>{start}</b>?",
+        kb([
+            ("✅ Да, удалить", f"adm_sched_del_yes_{start}"),
+            ("◀️ Отмена",       "adm_schedule"),
+        ]))
+
+async def adm_slot_delete_yes(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    start  = update.callback_query.data.replace("adm_slot_del_yes_", "")
+    ok, err = _tsvc(context).delete(start)
+    if ok:
+        await adm_schedule(update, context)
+    else:
+        await edit_or_reply(update, f"⚠️ {err}",
+            kb([("◀️ К расписанию", "adm_schedule")]))
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# О МАСТЕРЕ
+# ════════════════════════════════════════════════════════════════════════════════
+
+async def adm_about(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    bio          = settings.MASTER_BIO or "(не заполнено)"
+    bio_display  = bio.replace("\\n", "\n")
+    photo_status = "✅ загружено" if settings.MASTER_PHOTO_ID else "❌ не загружено"
+    await edit_or_reply(update,
+        f"👩‍🎨 <b>О мастере</b>\n\n"
+        f"<b>Текст:</b>\n{bio_display}\n\n"
+        f"<b>Фото:</b> {photo_status}\n"
+        f"<b>Адрес:</b> {settings.MASTER_ADDRESS}\n"
+        f"<b>Контакт:</b> {settings.MASTER_CONTACT}",
+        kb([
+            ("✏️ Текст",         "adm_about_edit_bio"),
+            ("📸 Фото",          "adm_about_edit_photo"),
+            ("🗑 Очистить фото", "adm_about_clear_photo"),
+            ("📍 Адрес",         "adm_about_edit_address"),
+            ("📞 Контакт",       "adm_about_edit_contact"),
+            ("◀️ Меню мастера",  "master_menu"),
+        ], cols=2))
+
+
+async def adm_about_edit_bio(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    set_step(context.user_data, "about_bio")
+    await edit_or_reply(update,
+        "✏️ Введите новый текст «О мастере».\n\nМожно использовать переносы строк.",
+        kb([("◀️ Отмена", "adm_about")]))
+
+
+async def _step_about_bio(update: Update, context: CallbackContext):
+    text = update.message.text.strip()
+    if not text:
+        await update.message.reply_text("Текст не может быть пустым. Попробуйте ещё раз.")
+        return
+    if len(text) > 800:
+        await update.message.reply_text(
+            f"Слишком длинный текст ({len(text)} символов, макс. 800).")
+        return
+    set_step(context.user_data, None)
+    settings.MASTER_BIO = text
+    settings.update_env_key("MASTER_BIO", text)
+    await update.message.reply_text("✅ Текст «О мастере» обновлён.",
+        reply_markup=kb([("◀️ К странице", "adm_about")] + back_master()))
+
+
+async def adm_about_edit_photo(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    set_step(context.user_data, "about_photo")
+    await edit_or_reply(update,
+        "📸 Отправьте фото для страницы «О мастере».",
+        kb([("◀️ Отмена", "adm_about")]))
+
+
+async def _step_about_photo(update: Update, context: CallbackContext):
+    set_step(context.user_data, None)
+    if not update.message or not update.message.photo:
+        await update.message.reply_text("Ожидается фото. Отправьте фото или нажмите Отмена.",
+            reply_markup=kb([("◀️ Отмена", "adm_about")]))
+        return
+    file_id = update.message.photo[-1].file_id
+    settings.MASTER_PHOTO_ID = file_id
+    settings.update_env_key("MASTER_PHOTO_ID", file_id)
+    await update.message.reply_text("✅ Фото обновлено.",
+        reply_markup=kb([("◀️ К странице", "adm_about")] + back_master()))
+
+
+async def adm_about_clear_photo(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    settings.MASTER_PHOTO_ID = ""
+    settings.update_env_key("MASTER_PHOTO_ID", "")
+    await edit_or_reply(update, "🗑 Фото удалено.",
+        kb([("◀️ К странице", "adm_about")] + back_master()))
+
+
+async def adm_about_edit_address(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    set_step(context.user_data, "about_address")
+    await edit_or_reply(update,
+        f"📍 <b>Текущий адрес:</b>\n{settings.MASTER_ADDRESS}\n\nВведите новый адрес:",
+        kb([("◀️ Отмена", "adm_about")]))
+
+
+async def _step_about_address(update: Update, context: CallbackContext):
+    text = (update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text("Адрес не может быть пустым.")
+        return
+    if len(text) > 200:
+        await update.message.reply_text("Слишком длинный адрес (макс. 200 символов).")
+        return
+    set_step(context.user_data, None)
+    settings.MASTER_ADDRESS = text
+    settings.update_env_key("MASTER_ADDRESS", text)
+    await update.message.reply_text(f"✅ Адрес обновлён:\n{text}",
+        reply_markup=kb([("◀️ К странице", "adm_about")] + back_master()))
+
+
+async def adm_about_edit_contact(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    set_step(context.user_data, "about_contact")
+    await edit_or_reply(update,
+        f"📞 <b>Текущий контакт:</b>\n{settings.MASTER_CONTACT}\n\n"
+        "Введите новый контакт (например @username или +7900...):",
+        kb([("◀️ Отмена", "adm_about")]))
+
+
+async def _step_about_contact(update: Update, context: CallbackContext):
+    text = (update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text("Контакт не может быть пустым.")
+        return
+    if len(text) > 100:
+        await update.message.reply_text("Слишком длинный контакт (макс. 100 символов).")
+        return
+    set_step(context.user_data, None)
+    settings.MASTER_CONTACT = text
+    settings.update_env_key("MASTER_CONTACT", text)
+    await update.message.reply_text(f"✅ Контакт обновлён:\n{text}",
+        reply_markup=kb([("◀️ К странице", "adm_about")] + back_master()))
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# ПРИГЛАШЕНИЕ
+# ════════════════════════════════════════════════════════════════════════════════
+
+async def adm_invite(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    link = f"https://t.me/{context.bot.username}"
+    text = (
+        f"📨 <b>Пригласить клиента</b>\n\n"
+        f"Скопируйте текст ниже и отправьте клиенту:\n\n"
+        f"<code>"
+        f"Привет! Теперь записаться ко мне на маникюр можно прямо в Telegram — "
+        f"быстро и удобно, без звонков.\n\n"
+        f"👉 {link}\n\n"
+        f"Нажми /start и выбери удобное время 💅"
+        f"</code>\n\n"
+        f"💡 Нажмите на текст чтобы скопировать."
+    )
+    await edit_or_reply(update, text, kb(back_master()))
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# ЧЁРНЫЙ СПИСОК
+# ════════════════════════════════════════════════════════════════════════════════
+
+async def adm_blacklist(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    banned = svc(context, K_BAN).all()
+    lines  = ["🚫 <b>Чёрный список</b>\n"]
+    if banned:
+        for row in banned:
+            client = svc(context, K_CLIENT).get(row["user_id"])
+            name   = client.display_name if client else f"id:{row['user_id']}"
+            reason = f" — {row['reason']}" if row["reason"] else ""
+            lines.append(f"• {name}{reason}")
+        lines.append("")
+    lines.append("Выберите клиента из базы чтобы добавить в чёрный список:")
+    banned_ids = {row["user_id"] for row in banned}
+    clients    = svc(context, K_CLIENT).all_clients()
+    buttons    = [
+        (f"🚫 {c.display_name}", f"adm_ban_{c.user_id}")
+        for c in clients if c.user_id not in banned_ids
+    ]
+    await edit_or_reply(update, "\n".join(lines),
+        kb(buttons + back_master()))
+
+
+async def adm_ban_client(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    user_id = int(update.callback_query.data.replace("adm_ban_", ""))
+    client  = svc(context, K_CLIENT).get(user_id)
+    name    = client.display_name if client else f"id:{user_id}"
+    await edit_or_reply(update,
+        f"Добавить <b>{name}</b> в чёрный список?\n\n"
+        f"Клиент не сможет взаимодействовать с ботом.",
+        kb([
+            ("✅ Да, заблокировать", f"adm_ban_yes_{user_id}"),
+            ("◀️ Отмена",            "adm_blacklist"),
+        ]))
+
+
+async def adm_ban_confirmed(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    user_id = int(update.callback_query.data.replace("adm_ban_yes_", ""))
+    client  = svc(context, K_CLIENT).get(user_id)
+    name    = client.display_name if client else f"id:{user_id}"
+    svc(context, K_BAN).ban(user_id)
+    await edit_or_reply(update,
+        f"🚫 <b>{name}</b> добавлен в чёрный список.",
+        kb([("◀️ Чёрный список", "adm_blacklist")] + back_master()))
+
+
+async def adm_unban_client(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    user_id = int(update.callback_query.data.replace("adm_unban_", ""))
+    client  = svc(context, K_CLIENT).get(user_id)
+    name    = client.display_name if client else f"id:{user_id}"
+    svc(context, K_BAN).unban(user_id)
+    await edit_or_reply(update,
+        f"✅ <b>{name}</b> удалён из чёрного списка.",
+        kb([("◀️ Чёрный список", "adm_blacklist")] + back_master()))
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# ЭКСПОРТ / ИМПОРТ КЛИЕНТОВ
+# ════════════════════════════════════════════════════════════════════════════════
+
+async def adm_export_clients(update, context):
+    import io, csv
+    from datetime import datetime
+    if update.callback_query:
+        await update.callback_query.answer()
+    clients = svc(context, K_CLIENT).all_clients()
+    if not clients:
+        await edit_or_reply(update, "Клиентов пока нет.", kb(back_master()))
+        return
+    buf    = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Имя", "Телефон", "Username", "Зарегистрирован"])
+    for c in clients:
+        reg = c.registered_at.strftime("%d.%m.%Y") if c.registered_at else "—"
+        writer.writerow([c.display_name, c.phone, c.username or "—", reg])
+    data     = buf.getvalue().encode("utf-8-sig")
+    filename = f"clients_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+    msg_target = (update.callback_query.message if update.callback_query else update.message)
+    await msg_target.reply_document(document=data, filename=filename,
+        caption=f"👥 Клиентская база: {len(clients)} человек")
+
+
+async def adm_import_clients(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    set_step(context.user_data, "import_clients")
+    await edit_or_reply(update,
+        "📥 <b>Импорт клиентов</b>\n\n"
+        "Загрузите Excel-файл (.xlsx) с колонками:\n"
+        "• <b>name</b> — имя клиента\n"
+        "• <b>phone</b> — телефон (+7...)\n\n"
+        "Отправьте файл:",
+        kb([("◀️ Отмена", "adm_crm")]))
+
+
+async def _step_import_clients(update: Update, context: CallbackContext):
+    import io, openpyxl
+    doc = update.message.document
+    if not doc or not doc.file_name.endswith(".xlsx"):
+        await update.message.reply_text("⚠️ Нужен файл в формате .xlsx",
+            reply_markup=kb([("◀️ Отмена", "adm_crm")]))
+        return
+    set_step(context.user_data, None)
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        buf     = io.BytesIO()
+        await tg_file.download_to_memory(buf)
+        buf.seek(0)
+        wb      = openpyxl.load_workbook(buf)
+        ws      = wb.active
+        headers = [str(c.value or "").strip().lower() for c in next(ws.iter_rows(min_row=1, max_row=1))]
+        if "name" not in headers or "phone" not in headers:
+            await update.message.reply_text(
+                "⚠️ В файле нет колонок <b>name</b> и <b>phone</b>.",
+                reply_markup=kb([("◀️ К клиентам", "adm_crm")]), parse_mode="HTML")
+            return
+        name_idx  = headers.index("name")
+        phone_idx = headers.index("phone")
+        rows = []
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            name  = str(row[name_idx]  or "").strip()
+            phone = str(row[phone_idx] or "").strip()
+            if name and phone:
+                rows.append({"name": name, "phone": phone})
+        added, updated = svc(context, K_CLIENT).import_clients(rows)
+        await update.message.reply_text(
+            f"✅ <b>Импорт завершён</b>\n\n"
+            f"Добавлено: <b>{added}</b>\n"
+            f"Обновлено: <b>{updated}</b>\n"
+            f"Всего строк: {len(rows)}",
+            reply_markup=kb([("👥 К клиентам", "adm_crm")] + back_master()),
+            parse_mode="HTML")
+    except Exception as e:
+        logger.error("import_clients: %s", e)
+        await update.message.reply_text("⚠️ Ошибка при обработке файла. Проверьте формат.",
+            reply_markup=kb([("◀️ К клиентам", "adm_crm")]))
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# УДАЛЕНИЕ КЛИЕНТА
+# ════════════════════════════════════════════════════════════════════════════════
+
+async def adm_delete_client(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    user_id = int(update.callback_query.data.replace("adm_delete_client_", ""))
+    client  = svc(context, K_CLIENT).get(user_id)
+    name    = client.display_name if client else f"id:{user_id}"
+    await edit_or_reply(update,
+        f"🗑 Удалить профиль <b>{name}</b>?\n\n"
+        "История записей сохранится. Удаляются только имя и телефон.",
+        kb([
+            ("✅ Да, удалить", f"adm_delete_client_yes_{user_id}"),
+            ("◀️ Отмена",      f"crm_{user_id}"),
+        ]))
+
+
+async def adm_delete_client_confirmed(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    user_id = int(update.callback_query.data.replace("adm_delete_client_yes_", ""))
+    client  = svc(context, K_CLIENT).get(user_id)
+    name    = client.display_name if client else f"id:{user_id}"
+    svc(context, K_CLIENT).delete_client(user_id)
+    await edit_or_reply(update,
+        f"🗑 Профиль <b>{name}</b> удалён.",
+        kb([("◀️ К клиентам", "adm_crm")] + back_master()))
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# ПОРТФОЛИО МАСТЕРА
+# ════════════════════════════════════════════════════════════════════════════════
+
+async def adm_portfolio(update: Update, context: CallbackContext):
+    """Список фото портфолио с кнопками удаления."""
+    await update.callback_query.answer()
+    photos = svc(context, K_PORTFOLIO).all()
+    count  = len(photos)
+    from app.repositories.repo import PortfolioRepo
+    max_p  = PortfolioRepo.MAX_PHOTOS
+
+    text = f"📸 <b>Портфолио</b>  {count}/{max_p} фото\n\n"
+    if photos:
+        text += "Нажмите на фото чтобы удалить:"
+    else:
+        text += "Фото пока нет. Добавьте первое!"
+
+    buttons = [(f"🗑 Фото {i+1}", f"adm_portfolio_del_{p['id']}")
+               for i, p in enumerate(photos)]
+
+    if count < max_p:
+        buttons.append(("➕ Добавить фото", "adm_portfolio_add"))
+
+    await edit_or_reply(update, text, kb(buttons + back_master()))
+
+
+async def adm_portfolio_add(update: Update, context: CallbackContext):
+    """Мастер отправляет фото для добавления в портфолио."""
+    await update.callback_query.answer()
+    set_step(context.user_data, "portfolio_add")
+    await edit_or_reply(update,
+        "📸 Отправьте фото для добавления в портфолио:",
+        kb([("◀️ Отмена", "adm_portfolio")]))
+
+
+async def _step_portfolio_add(update: Update, context: CallbackContext):
+    """Обрабатываем фото от мастера."""
+    set_step(context.user_data, None)
+    if not update.message.photo:
+        await update.message.reply_text(
+            "⚠️ Нужно отправить фото.",
+            reply_markup=kb([("◀️ Отмена", "adm_portfolio")]))
+        return
+    file_id = update.message.photo[-1].file_id
+    ok, err = svc(context, K_PORTFOLIO).add(file_id)
+    if ok:
+        count = svc(context, K_PORTFOLIO).count()
+        await update.message.reply_text(
+            f"✅ Фото добавлено! В портфолио {count} фото.",
+            reply_markup=kb([("📸 Портфолио", "adm_portfolio")] + back_master()))
+    else:
+        await update.message.reply_text(
+            f"⚠️ {err}",
+            reply_markup=kb([("📸 Портфолио", "adm_portfolio")] + back_master()))
+
+
+async def adm_portfolio_delete(update: Update, context: CallbackContext):
+    """Подтверждение удаления фото."""
+    await update.callback_query.answer()
+    photo_id = int(update.callback_query.data.replace("adm_portfolio_del_", ""))
+    await edit_or_reply(update,
+        "🗑 Удалить это фото из портфолио?",
+        kb([
+            ("✅ Да, удалить", f"adm_portfolio_del_yes_{photo_id}"),
+            ("◀️ Отмена",      "adm_portfolio"),
+        ]))
+
+
+async def adm_portfolio_delete_yes(update: Update, context: CallbackContext):
+    """Удаляем фото."""
+    await update.callback_query.answer()
+    photo_id = int(update.callback_query.data.replace("adm_portfolio_del_yes_", ""))
+    ok = svc(context, K_PORTFOLIO).delete(photo_id)
+    msg = "✅ Фото удалено." if ok else "⚠️ Фото не найдено."
+    await edit_or_reply(update, msg, kb([("📸 Портфолио", "adm_portfolio")] + back_master()))
