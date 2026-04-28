@@ -6,8 +6,12 @@ from __future__ import annotations
 
 import datetime
 import logging
+import os
+import atexit
+from pathlib import Path
 
 import pytz
+from telegram.error import Conflict
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -41,6 +45,47 @@ logger: logging.Logger
 
 _SIGN = f"\n\n— {settings.MASTER_USERNAME}"
 _TZ   = pytz.timezone(settings.TIMEZONE)
+_LOCK_FILE = Path(settings.DATA_DIR) / "bot.pid"
+
+
+def _acquire_single_instance_lock() -> None:
+    _LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    def _try_create_exclusive() -> bool:
+        try:
+            fd = os.open(str(_LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(str(os.getpid()))
+            return True
+        except FileExistsError:
+            return False
+
+    if not _try_create_exclusive():
+        old_pid = None
+        try:
+            old_pid = int(_LOCK_FILE.read_text(encoding="utf-8").strip())
+            os.kill(old_pid, 0)
+        except OSError:
+            try:
+                _LOCK_FILE.unlink()
+            except FileNotFoundError:
+                pass
+        except ValueError:
+            try:
+                _LOCK_FILE.unlink()
+            except FileNotFoundError:
+                pass
+
+        if not _try_create_exclusive():
+            raise RuntimeError(f"Bot already running (pid={old_pid}). Stop it before starting a new one.")
+
+    def _release_lock() -> None:
+        try:
+            if _LOCK_FILE.exists() and _LOCK_FILE.read_text(encoding="utf-8").strip() == str(os.getpid()):
+                _LOCK_FILE.unlink()
+        except Exception:
+            pass
+    atexit.register(_release_lock)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -203,6 +248,9 @@ async def job_expire_reschedules(context):
 
 async def error_handler(update, context):
     """Логирует все необработанные исключения и уведомляет мастера."""
+    if isinstance(context.error, Conflict):
+        logger.warning("Telegram conflict detected: another getUpdates consumer is active.")
+        return
     logger.exception("Unhandled exception", exc_info=context.error)
     try:
         err_text = "ERR: " + type(context.error).__name__ + ": " + str(context.error)
@@ -423,6 +471,7 @@ def build_application() -> Application:
 def main():
     global logger
     logger = setup_logging(settings.LOGS_DIR)
+    _acquire_single_instance_lock()
     logger.info("Запуск Salon Bot v14...")
 
     # 1. Миграции БД
