@@ -274,6 +274,7 @@ def build_application() -> Application:
     # КЛИЕНТ — навигация
     # ════════════════════════════════════════════════════════════════════════
     app.add_handler(CommandHandler(["start", "menu"], ch.cmd_start))
+    app.add_handler(CommandHandler("admin", mh.cmd_admin))
     app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
     app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, ch.handle_text))
     app.add_handler(MessageHandler(filters.TEXT  & ~filters.COMMAND, ch.handle_text))

@@ -59,7 +59,6 @@ async def cmd_start(update: Update, context: CallbackContext):
     svc(context, K_CLIENT).touch(uid, uname, first)
     set_step(context.user_data, None)
 
-    is_admin = uid in settings.ADMIN_IDS
     buttons  = [
         ("💅 Записаться",      "book_service"),
         ("📋 Мои записи",      "my_bookings"),
@@ -69,8 +68,6 @@ async def cmd_start(update: Update, context: CallbackContext):
         ("👩‍🎨 О мастере",        "about"),
         ("📞 Контакт мастера", "contact"),
     ]
-    if is_admin:
-        buttons.append(("👑 Панель мастера", "master_menu"))
 
     client = svc(context, K_CLIENT).get(uid)
     name   = client.display_name if client else first

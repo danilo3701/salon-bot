@@ -50,11 +50,31 @@ def _tsvc(context):
     return svc(context, K_TIMESLOT)
 
 
+def _is_admin(update: Update) -> bool:
+    user = update.effective_user
+    return bool(user and user.id in settings.ADMIN_IDS)
+
+
+async def cmd_admin(update: Update, context: CallbackContext):
+    if not _is_admin(update):
+        if update.message:
+            await safe_reply(update, "Команда недоступна.")
+        return
+    set_step(context.user_data, None)
+    await show_master_menu(update, context)
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 # ГЛАВНОЕ МЕНЮ МАСТЕРА
 # ════════════════════════════════════════════════════════════════════════════════
 
 async def show_master_menu(update: Update, context: CallbackContext):
+    if not _is_admin(update):
+        if update.callback_query:
+            await update.callback_query.answer("Недостаточно прав.", show_alert=True)
+        elif update.message:
+            await safe_reply(update, "Команда недоступна.")
+        return
     if update.callback_query:
         await update.callback_query.answer()
     from app.core.time_utils import local_now
