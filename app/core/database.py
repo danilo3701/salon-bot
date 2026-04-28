@@ -303,6 +303,26 @@ _MIGRATIONS: list[tuple[int, str, list[str]]] = [
         "CREATE INDEX IF NOT EXISTS idx_portfolio_position ON portfolio(position)",
     ]),
 
+    (8, "add weekly schedule templates", [
+        """CREATE TABLE IF NOT EXISTS weekly_day_templates (
+            weekday      INTEGER PRIMARY KEY CHECK(weekday BETWEEN 1 AND 7),
+            is_open      INTEGER NOT NULL DEFAULT 1 CHECK(is_open IN (0,1)),
+            closed_start TEXT,
+            closed_end   TEXT,
+            updated_at   TEXT NOT NULL
+                         DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+        )""",
+        """CREATE TABLE IF NOT EXISTS weekly_day_times (
+            weekday      INTEGER NOT NULL CHECK(weekday BETWEEN 1 AND 7),
+            hhmm         TEXT    NOT NULL,
+            sort_order   INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (weekday, hhmm),
+            FOREIGN KEY (weekday) REFERENCES weekly_day_templates(weekday) ON DELETE CASCADE
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_weekly_day_times_weekday_order ON weekly_day_times(weekday, sort_order, hhmm)",
+        "INSERT OR IGNORE INTO weekly_day_templates (weekday, is_open) VALUES (1,1),(2,1),(3,1),(4,1),(5,1),(6,1),(7,1)",
+    ]),
+
 ]
 
 

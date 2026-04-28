@@ -21,7 +21,7 @@ sys.path.insert(0, _BASE)
 # ── helpers ───────────────────────────────────────────────────────────────────
 class TestHelpers(unittest.TestCase):
     def setUp(self):
-        with open(os.path.join(_BASE, "app/bot/helpers.py")) as f:
+        with open(os.path.join(_BASE, "app/bot/helpers.py"), encoding="utf-8") as f:
             self.src = f.read()
 
     def test_parse_mode_html_is_string(self):
@@ -66,7 +66,7 @@ class TestHelpers(unittest.TestCase):
 # ── client.py ─────────────────────────────────────────────────────────────────
 class TestClientHandlers(unittest.TestCase):
     def setUp(self):
-        with open(os.path.join(_BASE, "app/bot/handlers/client.py")) as f:
+        with open(os.path.join(_BASE, "app/bot/handlers/client.py"), encoding="utf-8") as f:
             self.src = f.read()
 
     def _fn(self, name):
@@ -99,7 +99,7 @@ class TestClientHandlers(unittest.TestCase):
 # ── master.py ─────────────────────────────────────────────────────────────────
 class TestMasterHandlers(unittest.TestCase):
     def setUp(self):
-        with open(os.path.join(_BASE, "app/bot/handlers/master.py")) as f:
+        with open(os.path.join(_BASE, "app/bot/handlers/master.py"), encoding="utf-8") as f:
             self.src = f.read()
 
     def _fn(self, name):
@@ -134,11 +134,21 @@ class TestMasterHandlers(unittest.TestCase):
         body = self._fn("adm_calendar")
         self.assertIn("build_calendar_grid_master", body)
 
+    def test_ads_namespace_handlers_present(self):
+        self.assertIn("async def ads_root", self.src)
+        self.assertIn("async def ads_wd", self.src)
+        self.assertIn("async def ads_per", self.src)
+
+    def test_calendar_day_has_template_button(self):
+        body = self._fn("_show_day")
+        self.assertIn("Шаблон этого дня", body)
+        self.assertIn("calnav_", body)
+
 
 # ── database.py ───────────────────────────────────────────────────────────────
 class TestDatabaseMigrations(unittest.TestCase):
     def setUp(self):
-        with open(os.path.join(_BASE, "app/core/database.py")) as f:
+        with open(os.path.join(_BASE, "app/core/database.py"), encoding="utf-8") as f:
             self.src = f.read()
 
     def test_v7_in_migrations_list(self):
@@ -147,11 +157,16 @@ class TestDatabaseMigrations(unittest.TestCase):
     def test_portfolio_table_in_schema(self):
         self.assertIn("CREATE TABLE IF NOT EXISTS portfolio", self.src)
 
+    def test_v8_weekly_templates_in_migrations(self):
+        self.assertIn('(8, "add weekly schedule templates"', self.src)
+        self.assertIn("CREATE TABLE IF NOT EXISTS weekly_day_templates", self.src)
+        self.assertIn("CREATE TABLE IF NOT EXISTS weekly_day_times", self.src)
+
 
 # ── repo.py ───────────────────────────────────────────────────────────────────
 class TestPortfolioRepo(unittest.TestCase):
     def setUp(self):
-        with open(os.path.join(_BASE, "app/repositories/repo.py")) as f:
+        with open(os.path.join(_BASE, "app/repositories/repo.py"), encoding="utf-8") as f:
             self.src = f.read()
 
     def test_add_atomic_exists(self):
@@ -169,7 +184,7 @@ class TestPortfolioRepo(unittest.TestCase):
 # ── services.py ───────────────────────────────────────────────────────────────
 class TestServices(unittest.TestCase):
     def setUp(self):
-        with open(os.path.join(_BASE, "app/services/services.py")) as f:
+        with open(os.path.join(_BASE, "app/services/services.py"), encoding="utf-8") as f:
             self.src = f.read()
 
     def _portfolio_class(self):
@@ -192,6 +207,13 @@ class TestServices(unittest.TestCase):
         end = self.src.find("\n    def ", start + 1)
         count = self.src[start:end].count("BlockedSlotRepo.blocked_for_date")
         self.assertLessEqual(count, 1)
+
+    def test_weekly_schedule_service_exists(self):
+        self.assertIn("class WeeklyScheduleService", self.src)
+        self.assertIn("def times_for_date", self.src)
+
+    def test_booking_uses_weekly_times(self):
+        self.assertIn("self._weekly.times_for_date", self.src)
 
 
 if __name__ == "__main__":

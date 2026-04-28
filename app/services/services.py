@@ -1,22 +1,23 @@
-"""
-app/services/services.py — сервисный слой.
+﻿"""
+app/services/services.py â€” ÑÐµÑ€Ð²Ð¸ÑÐ½Ñ‹Ð¹ ÑÐ»Ð¾Ð¹.
 
-Исправления:
-  - NoteService выделен в отдельный класс (был склеен с ServiceService)
-  - BookingService.create() берёт цену из БД, а не settings.SERVICES
-  - BookingService.free_slots() / available_dates() читают TIME_SLOTS из settings
-    (они уже синхронизированы с БД через ServiceService._sync)
-  - review_candidates() использует дату визита, а не created_at_utc записи
-  - expire_reschedules() удаляет все сразу в одной транзакции
-  - ClientService.set_profile() валидирует формат телефона (RF, 10-11 цифр)
+Ð˜ÑÐ¿Ñ€Ð°Ð²Ð»ÐµÐ½Ð¸Ñ:
+  - NoteService Ð²Ñ‹Ð´ÐµÐ»ÐµÐ½ Ð² Ð¾Ñ‚Ð´ÐµÐ»ÑŒÐ½Ñ‹Ð¹ ÐºÐ»Ð°ÑÑ (Ð±Ñ‹Ð» ÑÐºÐ»ÐµÐµÐ½ Ñ ServiceService)
+  - BookingService.create() Ð±ÐµÑ€Ñ‘Ñ‚ Ñ†ÐµÐ½Ñƒ Ð¸Ð· Ð‘Ð”, Ð° Ð½Ðµ settings.SERVICES
+  - BookingService.free_slots() / available_dates() Ñ‡Ð¸Ñ‚Ð°ÑŽÑ‚ TIME_SLOTS Ð¸Ð· settings
+    (Ð¾Ð½Ð¸ ÑƒÐ¶Ðµ ÑÐ¸Ð½Ñ…Ñ€Ð¾Ð½Ð¸Ð·Ð¸Ñ€Ð¾Ð²Ð°Ð½Ñ‹ Ñ Ð‘Ð” Ñ‡ÐµÑ€ÐµÐ· ServiceService._sync)
+  - review_candidates() Ð¸ÑÐ¿Ð¾Ð»ÑŒÐ·ÑƒÐµÑ‚ Ð´Ð°Ñ‚Ñƒ Ð²Ð¸Ð·Ð¸Ñ‚Ð°, Ð° Ð½Ðµ created_at_utc Ð·Ð°Ð¿Ð¸ÑÐ¸
+  - expire_reschedules() ÑƒÐ´Ð°Ð»ÑÐµÑ‚ Ð²ÑÐµ ÑÑ€Ð°Ð·Ñƒ Ð² Ð¾Ð´Ð½Ð¾Ð¹ Ñ‚Ñ€Ð°Ð½Ð·Ð°ÐºÑ†Ð¸Ð¸
+  - ClientService.set_profile() Ð²Ð°Ð»Ð¸Ð´Ð¸Ñ€ÑƒÐµÑ‚ Ñ„Ð¾Ñ€Ð¼Ð°Ñ‚ Ñ‚ÐµÐ»ÐµÑ„Ð¾Ð½Ð° (RF, 10-11 Ñ†Ð¸Ñ„Ñ€)
 """
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+import re
+from datetime import date as dt_date, timedelta
 from typing import Optional
 
-# Валидация и нормализация телефонов — единственный источник правды
+# Ð’Ð°Ð»Ð¸Ð´Ð°Ñ†Ð¸Ñ Ð¸ Ð½Ð¾Ñ€Ð¼Ð°Ð»Ð¸Ð·Ð°Ñ†Ð¸Ñ Ñ‚ÐµÐ»ÐµÑ„Ð¾Ð½Ð¾Ð² â€” ÐµÐ´Ð¸Ð½ÑÑ‚Ð²ÐµÐ½Ð½Ñ‹Ð¹ Ð¸ÑÑ‚Ð¾Ñ‡Ð½Ð¸Ðº Ð¿Ñ€Ð°Ð²Ð´Ñ‹
 from app.core.phone import normalize_phone as _normalize_phone
 from app.core.phone import validate_phone as _validate_phone
 
@@ -34,6 +35,7 @@ from app.models.domain import (
 from app.repositories.repo import (
     BlacklistRepo, BlockedDayRepo, BlockedSlotRepo, BookingRepo, ClientRepo,
     NoteRepo, PortfolioRepo, RescheduleRepo, ReviewRepo, ServiceRepo, TimeSlotRepo,
+    WeeklyScheduleRepo,
 )
 from app.services.excel_worker import ExcelRow, enqueue
 
@@ -47,6 +49,143 @@ def _plural(n: int, one: str, few: str, many: str) -> str:
     if 2 <= r <= 4: return few
     return many
 
+
+_TIME_RE = re.compile(r"^\d{2}:\d{2}$")
+
+
+def _normalize_hhmm(value: str) -> str | None:
+    raw = (value or "").strip().replace(".", ":")
+    if raw and raw.count(":") == 1:
+        left, right = raw.split(":")
+        if left.isdigit() and right.isdigit():
+            raw = f"{int(left):02d}:{int(right):02d}"
+    if not _TIME_RE.match(raw):
+        return None
+    hh = int(raw[:2])
+    mm = int(raw[3:])
+    if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+        return None
+    return raw
+
+
+def _normalize_period(value: str) -> tuple[str, str] | None:
+    raw = (value or "").strip().replace("â€“", "-").replace("â€”", "-")
+    if "-" not in raw:
+        return None
+    left, right = raw.split("-", 1)
+    start = _normalize_hhmm(left)
+    end = _normalize_hhmm(right)
+    if not start or not end:
+        return None
+    if start >= end:
+        return None
+    return start, end
+
+
+def _weekday_from_date(date_str: str) -> int:
+    return dt_date.fromisoformat(date_str).isoweekday()
+
+
+class WeeklyScheduleService:
+
+    def list_days(self) -> list[dict]:
+        with get_db() as db:
+            return WeeklyScheduleRepo.all_day_templates(db)
+
+    def get_day_template(self, weekday: int) -> dict:
+        if weekday < 1 or weekday > 7:
+            raise ValueError("weekday must be 1..7")
+        with get_db() as db:
+            return WeeklyScheduleRepo.get_day_template(db, weekday)
+
+    def add_weekly_time(self, weekday: int, hhmm: str) -> tuple[bool, str]:
+        if weekday < 1 or weekday > 7:
+            return False, "ÐÐµÐºÐ¾Ñ€Ñ€ÐµÐºÑ‚Ð½Ñ‹Ð¹ Ð´ÐµÐ½ÑŒ Ð½ÐµÐ´ÐµÐ»Ð¸."
+        norm = _normalize_hhmm(hhmm)
+        if not norm:
+            return False, "Ð¤Ð¾Ñ€Ð¼Ð°Ñ‚ Ð²Ñ€ÐµÐ¼ÐµÐ½Ð¸: Ð§Ð§:ÐœÐœ."
+        with atomic() as db:
+            ok = WeeklyScheduleRepo.add_time(db, weekday, norm)
+        if not ok:
+            return False, f"Ð’Ñ€ÐµÐ¼Ñ {norm} ÑƒÐ¶Ðµ ÐµÑÑ‚ÑŒ Ð² ÑˆÐ°Ð±Ð»Ð¾Ð½Ðµ."
+        return True, norm
+
+    def remove_weekly_time(self, weekday: int, hhmm: str) -> tuple[bool, str]:
+        if weekday < 1 or weekday > 7:
+            return False, "ÐÐµÐºÐ¾Ñ€Ñ€ÐµÐºÑ‚Ð½Ñ‹Ð¹ Ð´ÐµÐ½ÑŒ Ð½ÐµÐ´ÐµÐ»Ð¸."
+        norm = _normalize_hhmm(hhmm)
+        if not norm:
+            return False, "ÐÐµÐºÐ¾Ñ€Ñ€ÐµÐºÑ‚Ð½Ð¾Ðµ Ð²Ñ€ÐµÐ¼Ñ."
+        with atomic() as db:
+            WeeklyScheduleRepo.remove_time(db, weekday, norm)
+        return True, norm
+
+    def toggle_day_open(self, weekday: int, is_open: bool) -> tuple[bool, str]:
+        if weekday < 1 or weekday > 7:
+            return False, "ÐÐµÐºÐ¾Ñ€Ñ€ÐµÐºÑ‚Ð½Ñ‹Ð¹ Ð´ÐµÐ½ÑŒ Ð½ÐµÐ´ÐµÐ»Ð¸."
+        if not is_open:
+            with get_db() as db:
+                today = local_today().isoformat()
+                rows = db.execute(
+                    "SELECT date FROM bookings WHERE status='active' AND date>=?",
+                    (today,),
+                ).fetchall()
+                for row in rows:
+                    if _weekday_from_date(row["date"]) == weekday:
+                        return False, "ÐÐµÐ»ÑŒÐ·Ñ Ð·Ð°ÐºÑ€Ñ‹Ñ‚ÑŒ Ð´ÐµÐ½ÑŒ: ÐµÑÑ‚ÑŒ Ð±ÑƒÐ´ÑƒÑ‰Ð¸Ðµ Ð·Ð°Ð¿Ð¸ÑÐ¸."
+        with atomic() as db:
+            WeeklyScheduleRepo.set_day_open(db, weekday, is_open)
+        return True, "ok"
+
+    def set_closed_period(self, weekday: int, start: str, end: str) -> tuple[bool, str]:
+        if weekday < 1 or weekday > 7:
+            return False, "ÐÐµÐºÐ¾Ñ€Ñ€ÐµÐºÑ‚Ð½Ñ‹Ð¹ Ð´ÐµÐ½ÑŒ Ð½ÐµÐ´ÐµÐ»Ð¸."
+        start_n = _normalize_hhmm(start)
+        end_n = _normalize_hhmm(end)
+        if not start_n or not end_n:
+            return False, "Ð¤Ð¾Ñ€Ð¼Ð°Ñ‚ Ð¿ÐµÑ€Ð¸Ð¾Ð´Ð°: Ð§Ð§:ÐœÐœ-Ð§Ð§:ÐœÐœ."
+        if start_n >= end_n:
+            return False, "ÐÐ°Ñ‡Ð°Ð»Ð¾ Ð¿ÐµÑ€Ð¸Ð¾Ð´Ð° Ð´Ð¾Ð»Ð¶Ð½Ð¾ Ð±Ñ‹Ñ‚ÑŒ Ñ€Ð°Ð½ÑŒÑˆÐµ ÐºÐ¾Ð½Ñ†Ð°."
+        with get_db() as db:
+            today = local_today().isoformat()
+            rows = db.execute(
+                "SELECT date, time FROM bookings WHERE status='active' AND date>=?",
+                (today,),
+            ).fetchall()
+            for row in rows:
+                if _weekday_from_date(row["date"]) != weekday:
+                    continue
+                if start_n <= row["time"] < end_n:
+                    return False, "ÐŸÐµÑ€Ð¸Ð¾Ð´ ÐºÐ¾Ð½Ñ„Ð»Ð¸ÐºÑ‚ÑƒÐµÑ‚ Ñ Ð±ÑƒÐ´ÑƒÑ‰Ð¸Ð¼Ð¸ Ð·Ð°Ð¿Ð¸ÑÑÐ¼Ð¸."
+        with atomic() as db:
+            WeeklyScheduleRepo.set_closed_period(db, weekday, start_n, end_n)
+        return True, f"{start_n}-{end_n}"
+
+    def clear_closed_period(self, weekday: int) -> tuple[bool, str]:
+        if weekday < 1 or weekday > 7:
+            return False, "ÐÐµÐºÐ¾Ñ€Ñ€ÐµÐºÑ‚Ð½Ñ‹Ð¹ Ð´ÐµÐ½ÑŒ Ð½ÐµÐ´ÐµÐ»Ð¸."
+        with atomic() as db:
+            WeeklyScheduleRepo.clear_closed_period(db, weekday)
+        return True, "ok"
+
+    def times_for_date(self, date_str: str, db=None) -> list[str]:
+        def _compute(conn) -> list[str]:
+            weekday = _weekday_from_date(date_str)
+            day = WeeklyScheduleRepo.get_day_template(conn, weekday)
+            if not day["is_open"]:
+                return []
+            times = sorted(day["times"])
+            if day["closed_start"] and day["closed_end"]:
+                times = [
+                    t for t in times
+                    if not (day["closed_start"] <= t < day["closed_end"])
+                ]
+            return times
+        if db is not None:
+            return _compute(db)
+        with get_db() as conn:
+            return _compute(conn)
+
 class ClientService:
 
     def touch(self, user_id: int, username: Optional[str], first_name: str):
@@ -58,13 +197,13 @@ class ClientService:
             return ClientRepo.get(db, user_id)
 
     def set_profile(self, user_id: int, name: str, phone: str):
-        """FIX: валидирует формат телефона перед сохранением в БД."""
+        """FIX: Ð²Ð°Ð»Ð¸Ð´Ð¸Ñ€ÑƒÐµÑ‚ Ñ„Ð¾Ñ€Ð¼Ð°Ñ‚ Ñ‚ÐµÐ»ÐµÑ„Ð¾Ð½Ð° Ð¿ÐµÑ€ÐµÐ´ ÑÐ¾Ñ…Ñ€Ð°Ð½ÐµÐ½Ð¸ÐµÐ¼ Ð² Ð‘Ð”."""
         if not phone or not phone.strip():
-            raise ValueError("Телефон клиента не может быть пустым")
+            raise ValueError("Ð¢ÐµÐ»ÐµÑ„Ð¾Ð½ ÐºÐ»Ð¸ÐµÐ½Ñ‚Ð° Ð½Ðµ Ð¼Ð¾Ð¶ÐµÑ‚ Ð±Ñ‹Ñ‚ÑŒ Ð¿ÑƒÑÑ‚Ñ‹Ð¼")
         if not _validate_phone(phone):
             raise ValueError(
-                f"Некорректный формат телефона: {phone!r}. "
-                "Ожидается российский номер +7/8 + 10 цифр."
+                f"ÐÐµÐºÐ¾Ñ€Ñ€ÐµÐºÑ‚Ð½Ñ‹Ð¹ Ñ„Ð¾Ñ€Ð¼Ð°Ñ‚ Ñ‚ÐµÐ»ÐµÑ„Ð¾Ð½Ð°: {phone!r}. "
+                "ÐžÐ¶Ð¸Ð´Ð°ÐµÑ‚ÑÑ Ñ€Ð¾ÑÑÐ¸Ð¹ÑÐºÐ¸Ð¹ Ð½Ð¾Ð¼ÐµÑ€ +7/8 + 10 Ñ†Ð¸Ñ„Ñ€."
             )
         normalized = _normalize_phone(phone)
         with atomic() as db:
@@ -75,7 +214,7 @@ class ClientService:
             return ClientRepo.all_registered(db)
 
     def delete_client(self, user_id: int) -> bool:
-        """Удаляет профиль клиента. Записи остаются."""
+        """Ð£Ð´Ð°Ð»ÑÐµÑ‚ Ð¿Ñ€Ð¾Ñ„Ð¸Ð»ÑŒ ÐºÐ»Ð¸ÐµÐ½Ñ‚Ð°. Ð—Ð°Ð¿Ð¸ÑÐ¸ Ð¾ÑÑ‚Ð°ÑŽÑ‚ÑÑ."""
         try:
             with atomic() as db:
                 ClientRepo.delete_profile(db, user_id)
@@ -86,8 +225,8 @@ class ClientService:
             return False
 
     def import_clients(self, rows: list[dict]) -> tuple[int, int]:
-        """Импортирует клиентов из списка {'name': ..., 'phone': ...}.
-        Возвращает (added, updated).
+        """Ð˜Ð¼Ð¿Ð¾Ñ€Ñ‚Ð¸Ñ€ÑƒÐµÑ‚ ÐºÐ»Ð¸ÐµÐ½Ñ‚Ð¾Ð² Ð¸Ð· ÑÐ¿Ð¸ÑÐºÐ° {'name': ..., 'phone': ...}.
+        Ð’Ð¾Ð·Ð²Ñ€Ð°Ñ‰Ð°ÐµÑ‚ (added, updated).
         """
         from app.core.phone import normalize_phone, validate_phone
         added = updated = 0
@@ -129,6 +268,8 @@ class ClientService:
         )
 
 class BookingService:
+    def __init__(self):
+        self._weekly = WeeklyScheduleService()
 
     def get(self, bid: int) -> Optional[Booking]:
         with get_db() as db:
@@ -154,26 +295,30 @@ class BookingService:
         with get_db() as db:
             if BlockedDayRepo.is_blocked(db, date):
                 return []
+            base_times = self._weekly.times_for_date(date, db=db)
             booked = BookingRepo.booked_times(db, date)
             blocked_slots = BlockedSlotRepo.blocked_for_date(db, date)
         occupied = booked | blocked_slots
-        return [t for t in settings.TIME_SLOTS if t not in occupied]
+        return [t for t in base_times if t not in occupied]
 
     def available_dates(self) -> list[SlotInfo]:
         dates = booking_dates()
         with get_db() as db:
             blocked  = BlockedDayRepo.blocked_set(db)
             booked_m = BookingRepo.booked_times_bulk(db, dates)
-        return [
-            SlotInfo(date=d, free_times=[
-                t for t in settings.TIME_SLOTS
-                if t not in booked_m.get(d, set())
-            ])
-            for d in dates
-            if d not in blocked and any(
-                t not in booked_m.get(d, set()) for t in settings.TIME_SLOTS
-            )
-        ]
+            bslots_m = BlockedSlotRepo.blocked_bulk(db, dates)
+            out: list[SlotInfo] = []
+            for d in dates:
+                if d in blocked:
+                    continue
+                base_times = self._weekly.times_for_date(d, db=db)
+                if not base_times:
+                    continue
+                occupied = booked_m.get(d, set()) | bslots_m.get(d, set())
+                free = [t for t in base_times if t not in occupied]
+                if free:
+                    out.append(SlotInfo(date=d, free_times=free))
+            return out
 
     def calendar(self, days: int = 14) -> list[SlotInfo]:
         today  = local_today()
@@ -187,8 +332,9 @@ class BookingService:
             if d in blocked:
                 result.append(SlotInfo(date=d, free_times=[], is_blocked=True))
             else:
+                base_times = self._weekly.times_for_date(d, db=db)
                 occupied = booked_m.get(d, set()) | bslots_m.get(d, set())
-                free = [t for t in settings.TIME_SLOTS if t not in occupied]
+                free = [t for t in base_times if t not in occupied]
                 result.append(SlotInfo(date=d, free_times=free))
         return result
 
@@ -197,13 +343,13 @@ class BookingService:
             return BlockedDayRepo.all(db)
 
     def slots_for_day(self, date: str) -> dict:
-        """Возвращает все слоты дня с их статусом для панели мастера."""
         with get_db() as db:
+            base_times   = self._weekly.times_for_date(date, db=db)
             booked       = BookingRepo.booked_times(db, date)
             blocked_day  = BlockedDayRepo.is_blocked(db, date)
             blocked_slots = BlockedSlotRepo.blocked_for_date(db, date)
         result = []
-        for t in settings.TIME_SLOTS:
+        for t in base_times:
             if t in booked:
                 status = "booked"
             elif blocked_day or t in blocked_slots:
@@ -211,7 +357,12 @@ class BookingService:
             else:
                 status = "free"
             result.append({"time": t, "status": status})
-        return {"date": date, "slots": result, "day_blocked": blocked_day}
+        return {
+            "date": date,
+            "slots": result,
+            "day_blocked": blocked_day,
+            "template_count": len(base_times),
+        }
 
     def block_slot(self, date: str, time: str) -> bool:
         try:
@@ -243,33 +394,35 @@ class BookingService:
             month_label=month,
         )
 
-    # Максимум активных записей на одного клиента
+    # ÐœÐ°ÐºÑÐ¸Ð¼ÑƒÐ¼ Ð°ÐºÑ‚Ð¸Ð²Ð½Ñ‹Ñ… Ð·Ð°Ð¿Ð¸ÑÐµÐ¹ Ð½Ð° Ð¾Ð´Ð½Ð¾Ð³Ð¾ ÐºÐ»Ð¸ÐµÐ½Ñ‚Ð°
     MAX_ACTIVE_PER_CLIENT: int = 5
 
     def create(self, user_id: int, service: str, date: str, time: str) -> BookingResult:
         """
-        FIX: цена берётся из БД (через settings.SERVICES, синхронизированного
-        ServiceService._sync), а не из захардкоженного словаря.
+        FIX: Ñ†ÐµÐ½Ð° Ð±ÐµÑ€Ñ‘Ñ‚ÑÑ Ð¸Ð· Ð‘Ð” (Ñ‡ÐµÑ€ÐµÐ· settings.SERVICES, ÑÐ¸Ð½Ñ…Ñ€Ð¾Ð½Ð¸Ð·Ð¸Ñ€Ð¾Ð²Ð°Ð½Ð½Ð¾Ð³Ð¾
+        ServiceService._sync), Ð° Ð½Ðµ Ð¸Ð· Ð·Ð°Ñ…Ð°Ñ€Ð´ÐºÐ¾Ð¶ÐµÐ½Ð½Ð¾Ð³Ð¾ ÑÐ»Ð¾Ð²Ð°Ñ€Ñ.
         """
         if service not in settings.SERVICES:
-            return BookingResult(ok=False, error="Неизвестная услуга.")
-        if time not in settings.TIME_SLOTS:
-            return BookingResult(ok=False, error="Некорректное время.")
+            return BookingResult(ok=False, error="ÐÐµÐ¸Ð·Ð²ÐµÑÑ‚Ð½Ð°Ñ ÑƒÑÐ»ÑƒÐ³Ð°.")
+        time = _normalize_hhmm(time or "") or (time or "")
         price = settings.SERVICES[service]
         try:
             with atomic() as db:
+                day_times = self._weekly.times_for_date(date, db=db)
+                if time not in day_times:
+                    return BookingResult(ok=False, error="Ð­Ñ‚Ð¾ Ð²Ñ€ÐµÐ¼Ñ Ð½ÐµÐ´Ð¾ÑÑ‚ÑƒÐ¿Ð½Ð¾ Ð² Ñ€Ð°ÑÐ¿Ð¸ÑÐ°Ð½Ð¸Ð¸.")
                 if BlockedDayRepo.is_blocked(db, date):
-                    return BookingResult(ok=False, error="День закрыт для записи.")
+                    return BookingResult(ok=False, error="Ð”ÐµÐ½ÑŒ Ð·Ð°ÐºÑ€Ñ‹Ñ‚ Ð´Ð»Ñ Ð·Ð°Ð¿Ð¸ÑÐ¸.")
                 if time in BlockedSlotRepo.blocked_for_date(db, date):
 
-                    return BookingResult(ok=False, error="Этот слот недоступен — выберите другое время.")
+                    return BookingResult(ok=False, error="Ð­Ñ‚Ð¾Ñ‚ ÑÐ»Ð¾Ñ‚ Ð½ÐµÐ´Ð¾ÑÑ‚ÑƒÐ¿ÐµÐ½ â€” Ð²Ñ‹Ð±ÐµÑ€Ð¸Ñ‚Ðµ Ð´Ñ€ÑƒÐ³Ð¾Ðµ Ð²Ñ€ÐµÐ¼Ñ.")
                 booked = BookingRepo.booked_times(db, date)
                 if time in booked:
                     return BookingResult(ok=False,
-                                        error="Слот только что заняли — выберите другое время.")
-                if len(booked) >= settings.MAX_SLOTS_PER_DAY:
-                    return BookingResult(ok=False, error="День полностью занят.")
-                # Лимит активных записей на одного клиента
+                                        error="Ð¡Ð»Ð¾Ñ‚ Ñ‚Ð¾Ð»ÑŒÐºÐ¾ Ñ‡Ñ‚Ð¾ Ð·Ð°Ð½ÑÐ»Ð¸ â€” Ð²Ñ‹Ð±ÐµÑ€Ð¸Ñ‚Ðµ Ð´Ñ€ÑƒÐ³Ð¾Ðµ Ð²Ñ€ÐµÐ¼Ñ.")
+                if len(booked) >= len(day_times):
+                    return BookingResult(ok=False, error="Ð”ÐµÐ½ÑŒ Ð¿Ð¾Ð»Ð½Ð¾ÑÑ‚ÑŒÑŽ Ð·Ð°Ð½ÑÑ‚.")
+                # Ð›Ð¸Ð¼Ð¸Ñ‚ Ð°ÐºÑ‚Ð¸Ð²Ð½Ñ‹Ñ… Ð·Ð°Ð¿Ð¸ÑÐµÐ¹ Ð½Ð° Ð¾Ð´Ð½Ð¾Ð³Ð¾ ÐºÐ»Ð¸ÐµÐ½Ñ‚Ð°
                 active_count = db.execute(
                     "SELECT COUNT(*) FROM bookings WHERE user_id=? AND status='active'",
                     (user_id,),
@@ -277,62 +430,69 @@ class BookingService:
                 if active_count >= self.MAX_ACTIVE_PER_CLIENT:
                     return BookingResult(
                         ok=False,
-                        error=f"У вас уже {active_count} активных "
-                              f"{_plural(active_count, 'запись', 'записи', 'записей')}. "
-                              f"Максимум — {self.MAX_ACTIVE_PER_CLIENT}. "
-                              f"Отмените одну из существующих, чтобы создать новую.",
+                        error=f"Ð£ Ð²Ð°Ñ ÑƒÐ¶Ðµ {active_count} Ð°ÐºÑ‚Ð¸Ð²Ð½Ñ‹Ñ… "
+                              f"{_plural(active_count, 'Ð·Ð°Ð¿Ð¸ÑÑŒ', 'Ð·Ð°Ð¿Ð¸ÑÐ¸', 'Ð·Ð°Ð¿Ð¸ÑÐµÐ¹')}. "
+                              f"ÐœÐ°ÐºÑÐ¸Ð¼ÑƒÐ¼ â€” {self.MAX_ACTIVE_PER_CLIENT}. "
+                              f"ÐžÑ‚Ð¼ÐµÐ½Ð¸Ñ‚Ðµ Ð¾Ð´Ð½Ñƒ Ð¸Ð· ÑÑƒÑ‰ÐµÑÑ‚Ð²ÑƒÑŽÑ‰Ð¸Ñ…, Ñ‡Ñ‚Ð¾Ð±Ñ‹ ÑÐ¾Ð·Ð´Ð°Ñ‚ÑŒ Ð½Ð¾Ð²ÑƒÑŽ.",
                     )
                 bid     = BookingRepo.insert(db, user_id, service, price, date, time)
                 booking = BookingRepo.get(db, bid)
             client = self._get_client_name(user_id)
-            enqueue(ExcelRow("запись", client[0], client[1],
+            enqueue(ExcelRow("Ð·Ð°Ð¿Ð¸ÑÑŒ", client[0], client[1],
                              service, date, time, price, "active"))
             logger.info("create bid=%s uid=%s %s %s", bid, user_id, date, time)
             return BookingResult(ok=True, booking=booking)
         except Exception as e:
             logger.error("create uid=%s: %s", user_id, e)
-            return BookingResult(ok=False, error="Не удалось создать запись. Попробуйте ещё раз.")
+            return BookingResult(ok=False, error="ÐÐµ ÑƒÐ´Ð°Ð»Ð¾ÑÑŒ ÑÐ¾Ð·Ð´Ð°Ñ‚ÑŒ Ð·Ð°Ð¿Ð¸ÑÑŒ. ÐŸÐ¾Ð¿Ñ€Ð¾Ð±ÑƒÐ¹Ñ‚Ðµ ÐµÑ‰Ñ‘ Ñ€Ð°Ð·.")
 
     def cancel(self, bid: int, by_user: int) -> BookingResult:
         with get_db() as db:
             booking = BookingRepo.get(db, bid)
         if not booking:
-            return BookingResult(ok=False, error="Запись не найдена.")
+            return BookingResult(ok=False, error="Ð—Ð°Ð¿Ð¸ÑÑŒ Ð½Ðµ Ð½Ð°Ð¹Ð´ÐµÐ½Ð°.")
         if booking.status != BookingStatus.ACTIVE:
-            return BookingResult(ok=False, error="Запись уже неактивна.")
+            return BookingResult(ok=False, error="Ð—Ð°Ð¿Ð¸ÑÑŒ ÑƒÐ¶Ðµ Ð½ÐµÐ°ÐºÑ‚Ð¸Ð²Ð½Ð°.")
         if booking.user_id != by_user and by_user not in settings.ADMIN_IDS:
-            return BookingResult(ok=False, error="Нет прав для отмены.")
+            return BookingResult(ok=False, error="ÐÐµÑ‚ Ð¿Ñ€Ð°Ð² Ð´Ð»Ñ Ð¾Ñ‚Ð¼ÐµÐ½Ñ‹.")
         try:
             with atomic() as db:
                 BookingRepo.set_status(db, bid, BookingStatus.CANCELLED)
                 RescheduleRepo.delete_by_booking(db, bid)
             client = self._get_client_name(booking.user_id)
-            enqueue(ExcelRow("отмена", client[0], client[1],
+            enqueue(ExcelRow("Ð¾Ñ‚Ð¼ÐµÐ½Ð°", client[0], client[1],
                              booking.service, booking.date, booking.time, 0, "cancelled"))
             logger.info("cancel bid=%s by=%s", bid, by_user)
             return BookingResult(ok=True, booking=booking)
         except Exception as e:
             logger.error("cancel bid=%s: %s", bid, e)
-            return BookingResult(ok=False, error="Не удалось отменить.")
+            return BookingResult(ok=False, error="ÐÐµ ÑƒÐ´Ð°Ð»Ð¾ÑÑŒ Ð¾Ñ‚Ð¼ÐµÐ½Ð¸Ñ‚ÑŒ.")
 
     def confirm_reschedule(self, booking_id: int) -> BookingResult:
         with get_db() as db:
             rr      = RescheduleRepo.get_by_booking(db, booking_id)
             booking = BookingRepo.get(db, booking_id)
         if not rr or not booking:
-            return BookingResult(ok=False, error="Запрос на перенос не найден.")
+            return BookingResult(ok=False, error="Ð—Ð°Ð¿Ñ€Ð¾Ñ Ð½Ð° Ð¿ÐµÑ€ÐµÐ½Ð¾Ñ Ð½Ðµ Ð½Ð°Ð¹Ð´ÐµÐ½.")
         try:
             with atomic() as db:
+                day_times = self._weekly.times_for_date(rr.new_date, db=db)
+                if rr.new_time not in day_times:
+                    return BookingResult(ok=False, error="Ð­Ñ‚Ð¾ Ð²Ñ€ÐµÐ¼Ñ Ð½ÐµÐ´Ð¾ÑÑ‚ÑƒÐ¿Ð½Ð¾ Ð² Ñ€Ð°ÑÐ¿Ð¸ÑÐ°Ð½Ð¸Ð¸.")
+                if BlockedDayRepo.is_blocked(db, rr.new_date):
+                    return BookingResult(ok=False, error="Ð”ÐµÐ½ÑŒ Ð·Ð°ÐºÑ€Ñ‹Ñ‚ Ð´Ð»Ñ Ð·Ð°Ð¿Ð¸ÑÐ¸.")
+                if rr.new_time in BlockedSlotRepo.blocked_for_date(db, rr.new_date):
+                    return BookingResult(ok=False, error="Ð­Ñ‚Ð¾Ñ‚ ÑÐ»Ð¾Ñ‚ Ð½ÐµÐ´Ð¾ÑÑ‚ÑƒÐ¿ÐµÐ½.")
                 booked = BookingRepo.booked_times(db, rr.new_date)
                 if rr.new_time in booked:
-                    return BookingResult(ok=False, error="Слот уже занят.")
+                    return BookingResult(ok=False, error="Ð¡Ð»Ð¾Ñ‚ ÑƒÐ¶Ðµ Ð·Ð°Ð½ÑÑ‚.")
                 BookingRepo.set_slot(db, booking_id, rr.new_date, rr.new_time)
                 RescheduleRepo.delete(db, rr.id)
                 updated = BookingRepo.get(db, booking_id)
             return BookingResult(ok=True, booking=updated)
         except Exception as e:
             logger.error("confirm_reschedule bid=%s: %s", booking_id, e)
-            return BookingResult(ok=False, error="Не удалось перенести.")
+            return BookingResult(ok=False, error="ÐÐµ ÑƒÐ´Ð°Ð»Ð¾ÑÑŒ Ð¿ÐµÑ€ÐµÐ½ÐµÑÑ‚Ð¸.")
 
     def decline_reschedule(self, booking_id: int):
         with atomic() as db:
@@ -366,7 +526,7 @@ class BookingService:
         with atomic() as db:
             count = BookingRepo.complete_past(db, today)
         if count:
-            logger.info("complete_past: %d bookings → completed", count)
+            logger.info("complete_past: %d bookings â†’ completed", count)
         return count
 
     def pending_reminders(self) -> dict[str, list[Booking]]:
@@ -388,15 +548,15 @@ class BookingService:
 
     def review_candidates(self) -> list[Booking]:
         """
-        FIX: используем дату визита (b.date), а не created_at_utc записи.
-        Кандидаты — записи, у которых дата визита <= сегодня - REVIEW_DELAY_HOURS.
+        FIX: Ð¸ÑÐ¿Ð¾Ð»ÑŒÐ·ÑƒÐµÐ¼ Ð´Ð°Ñ‚Ñƒ Ð²Ð¸Ð·Ð¸Ñ‚Ð° (b.date), Ð° Ð½Ðµ created_at_utc Ð·Ð°Ð¿Ð¸ÑÐ¸.
+        ÐšÐ°Ð½Ð´Ð¸Ð´Ð°Ñ‚Ñ‹ â€” Ð·Ð°Ð¿Ð¸ÑÐ¸, Ñƒ ÐºÐ¾Ñ‚Ð¾Ñ€Ñ‹Ñ… Ð´Ð°Ñ‚Ð° Ð²Ð¸Ð·Ð¸Ñ‚Ð° <= ÑÐµÐ³Ð¾Ð´Ð½Ñ - REVIEW_DELAY_HOURS.
         """
         cutoff = review_cutoff_utc()
         with get_db() as db:
             return BookingRepo.review_candidates(db, cutoff)
 
     def expire_reschedules(self) -> list[RescheduleRequest]:
-        """FIX: удаляем все истёкшие за одну транзакцию."""
+        """FIX: ÑƒÐ´Ð°Ð»ÑÐµÐ¼ Ð²ÑÐµ Ð¸ÑÑ‚Ñ‘ÐºÑˆÐ¸Ðµ Ð·Ð° Ð¾Ð´Ð½Ñƒ Ñ‚Ñ€Ð°Ð½Ð·Ð°ÐºÑ†Ð¸ÑŽ."""
         with get_db() as db:
             expired = RescheduleRepo.expired(db)
         if expired:
@@ -409,10 +569,10 @@ class BookingService:
     def _get_client_name(self, user_id: int) -> tuple[str, str]:
         with get_db() as db:
             c = ClientRepo.get(db, user_id)
-        return (c.name if c else "—"), (c.phone if c else "—")
+        return (c.name if c else "â€”"), (c.phone if c else "â€”")
 
 class NoteService:
-    """FIX: был ошибочно склеен с ServiceService."""
+    """FIX: Ð±Ñ‹Ð» Ð¾ÑˆÐ¸Ð±Ð¾Ñ‡Ð½Ð¾ ÑÐºÐ»ÐµÐµÐ½ Ñ ServiceService."""
 
     def add(self, user_id: int, author_id: int, text: str):
         with atomic() as db:
@@ -420,16 +580,16 @@ class NoteService:
         logger.info("note user=%s by=%s", user_id, author_id)
 
 class ServiceService:
-    """Управление услугами. После каждого изменения синхронизирует settings.SERVICES."""
+    """Ð£Ð¿Ñ€Ð°Ð²Ð»ÐµÐ½Ð¸Ðµ ÑƒÑÐ»ÑƒÐ³Ð°Ð¼Ð¸. ÐŸÐ¾ÑÐ»Ðµ ÐºÐ°Ð¶Ð´Ð¾Ð³Ð¾ Ð¸Ð·Ð¼ÐµÐ½ÐµÐ½Ð¸Ñ ÑÐ¸Ð½Ñ…Ñ€Ð¾Ð½Ð¸Ð·Ð¸Ñ€ÑƒÐµÑ‚ settings.SERVICES."""
 
     def sync(self) -> dict[str, int]:
-        """Загружает актуальный список услуг из БД и обновляет settings.SERVICES."""
+        """Ð—Ð°Ð³Ñ€ÑƒÐ¶Ð°ÐµÑ‚ Ð°ÐºÑ‚ÑƒÐ°Ð»ÑŒÐ½Ñ‹Ð¹ ÑÐ¿Ð¸ÑÐ¾Ðº ÑƒÑÐ»ÑƒÐ³ Ð¸Ð· Ð‘Ð” Ð¸ Ð¾Ð±Ð½Ð¾Ð²Ð»ÑÐµÑ‚ settings.SERVICES."""
         with get_db() as db:
             rows = ServiceRepo.all_active(db)
         settings.update_services(dict(rows))
         return settings.SERVICES
 
-    # публичный псевдоним для main.py
+    # Ð¿ÑƒÐ±Ð»Ð¸Ñ‡Ð½Ñ‹Ð¹ Ð¿ÑÐµÐ²Ð´Ð¾Ð½Ð¸Ð¼ Ð´Ð»Ñ main.py
     def _sync(self) -> dict[str, int]:
         return self.sync()
 
@@ -439,19 +599,19 @@ class ServiceService:
     def add(self, name: str, price: int) -> tuple[bool, str]:
         name = name.strip()
         if not name:
-            return False, "Название не может быть пустым."
+            return False, "ÐÐ°Ð·Ð²Ð°Ð½Ð¸Ðµ Ð½Ðµ Ð¼Ð¾Ð¶ÐµÑ‚ Ð±Ñ‹Ñ‚ÑŒ Ð¿ÑƒÑÑ‚Ñ‹Ð¼."
         if price <= 0:
-            return False, "Цена должна быть больше 0."
+            return False, "Ð¦ÐµÐ½Ð° Ð´Ð¾Ð»Ð¶Ð½Ð° Ð±Ñ‹Ñ‚ÑŒ Ð±Ð¾Ð»ÑŒÑˆÐµ 0."
         with atomic() as db:
             ok = ServiceRepo.insert(db, name, price)
         if not ok:
-            return False, f"Услуга «{name}» уже существует."
+            return False, f"Ð£ÑÐ»ÑƒÐ³Ð° Â«{name}Â» ÑƒÐ¶Ðµ ÑÑƒÑ‰ÐµÑÑ‚Ð²ÑƒÐµÑ‚."
         self.sync()
         return True, ""
 
     def update_price(self, name: str, new_price: int) -> tuple[bool, str]:
         if new_price <= 0:
-            return False, "Цена должна быть больше 0."
+            return False, "Ð¦ÐµÐ½Ð° Ð´Ð¾Ð»Ð¶Ð½Ð° Ð±Ñ‹Ñ‚ÑŒ Ð±Ð¾Ð»ÑŒÑˆÐµ 0."
         with atomic() as db:
             ServiceRepo.update_price(db, name, new_price)
         self.sync()
@@ -460,11 +620,11 @@ class ServiceService:
     def rename(self, old_name: str, new_name: str) -> tuple[bool, str]:
         new_name = new_name.strip()
         if not new_name:
-            return False, "Название не может быть пустым."
+            return False, "ÐÐ°Ð·Ð²Ð°Ð½Ð¸Ðµ Ð½Ðµ Ð¼Ð¾Ð¶ÐµÑ‚ Ð±Ñ‹Ñ‚ÑŒ Ð¿ÑƒÑÑ‚Ñ‹Ð¼."
         with atomic() as db:
             ok = ServiceRepo.rename(db, old_name, new_name)
         if not ok:
-            return False, f"Услуга «{new_name}» уже существует."
+            return False, f"Ð£ÑÐ»ÑƒÐ³Ð° Â«{new_name}Â» ÑƒÐ¶Ðµ ÑÑƒÑ‰ÐµÑÑ‚Ð²ÑƒÐµÑ‚."
         self.sync()
         return True, ""
 
@@ -475,7 +635,7 @@ class ServiceService:
                 (name,),
             ).fetchone()[0]
         if count > 0:
-            return False, f"Нельзя удалить: есть {count} активных записей на «{name}»."
+            return False, f"ÐÐµÐ»ÑŒÐ·Ñ ÑƒÐ´Ð°Ð»Ð¸Ñ‚ÑŒ: ÐµÑÑ‚ÑŒ {count} Ð°ÐºÑ‚Ð¸Ð²Ð½Ñ‹Ñ… Ð·Ð°Ð¿Ð¸ÑÐµÐ¹ Ð½Ð° Â«{name}Â»."
         with atomic() as db:
             ServiceRepo.delete(db, name)
         self.sync()
@@ -485,14 +645,14 @@ class ReviewService:
 
     def add(self, user_id: int, booking_id: int,
             rating: int, text: str) -> int:
-        """Создаёт отзыв. Возвращает review_id для последующего прикрепления фото."""
+        """Ð¡Ð¾Ð·Ð´Ð°Ñ‘Ñ‚ Ð¾Ñ‚Ð·Ñ‹Ð². Ð’Ð¾Ð·Ð²Ñ€Ð°Ñ‰Ð°ÐµÑ‚ review_id Ð´Ð»Ñ Ð¿Ð¾ÑÐ»ÐµÐ´ÑƒÑŽÑ‰ÐµÐ³Ð¾ Ð¿Ñ€Ð¸ÐºÑ€ÐµÐ¿Ð»ÐµÐ½Ð¸Ñ Ñ„Ð¾Ñ‚Ð¾."""
         with atomic() as db:
             rid = ReviewRepo.insert(db, user_id, booking_id, rating, text)
         logger.info("review uid=%s bid=%s rating=%s", user_id, booking_id, rating)
         return rid
 
     def attach_photo(self, review_id: int, photo_file_id: str):
-        """Прикрепляет фото к уже созданному отзыву."""
+        """ÐŸÑ€Ð¸ÐºÑ€ÐµÐ¿Ð»ÑÐµÑ‚ Ñ„Ð¾Ñ‚Ð¾ Ðº ÑƒÐ¶Ðµ ÑÐ¾Ð·Ð´Ð°Ð½Ð½Ð¾Ð¼Ñƒ Ð¾Ñ‚Ð·Ñ‹Ð²Ñƒ."""
         with atomic() as db:
             ReviewRepo.update_photo(db, review_id, photo_file_id)
         logger.info("review photo review_id=%s", review_id)
@@ -502,8 +662,8 @@ class ReviewService:
             return ReviewRepo.recent(db, limit)
 
 class TimeSlotService:
-    """Управление временными слотами мастера.
-    После каждого изменения синхронизирует settings.TIME_SLOTS.
+    """Ð£Ð¿Ñ€Ð°Ð²Ð»ÐµÐ½Ð¸Ðµ Ð²Ñ€ÐµÐ¼ÐµÐ½Ð½Ñ‹Ð¼Ð¸ ÑÐ»Ð¾Ñ‚Ð°Ð¼Ð¸ Ð¼Ð°ÑÑ‚ÐµÑ€Ð°.
+    ÐŸÐ¾ÑÐ»Ðµ ÐºÐ°Ð¶Ð´Ð¾Ð³Ð¾ Ð¸Ð·Ð¼ÐµÐ½ÐµÐ½Ð¸Ñ ÑÐ¸Ð½Ñ…Ñ€Ð¾Ð½Ð¸Ð·Ð¸Ñ€ÑƒÐµÑ‚ settings.TIME_SLOTS.
     """
 
     def sync(self) -> dict[str, str]:
@@ -517,44 +677,44 @@ class TimeSlotService:
             return TimeSlotRepo.all(db)
 
     def add(self, start: str, end: str) -> tuple[bool, str]:
-        """Добавить слот. start/end в формате HH:MM."""
+        """Ð”Ð¾Ð±Ð°Ð²Ð¸Ñ‚ÑŒ ÑÐ»Ð¾Ñ‚. start/end Ð² Ñ„Ð¾Ñ€Ð¼Ð°Ñ‚Ðµ HH:MM."""
         import re
         _t = re.compile(r"^\d{2}:\d{2}$")
         if not _t.match(start) or not _t.match(end):
-            return False, "Формат времени: ЧЧ:ММ (например 10:00)"
+            return False, "Ð¤Ð¾Ñ€Ð¼Ð°Ñ‚ Ð²Ñ€ÐµÐ¼ÐµÐ½Ð¸: Ð§Ð§:ÐœÐœ (Ð½Ð°Ð¿Ñ€Ð¸Ð¼ÐµÑ€ 10:00)"
         if start >= end:
-            return False, "Время начала должно быть раньше конца."
+            return False, "Ð’Ñ€ÐµÐ¼Ñ Ð½Ð°Ñ‡Ð°Ð»Ð° Ð´Ð¾Ð»Ð¶Ð½Ð¾ Ð±Ñ‹Ñ‚ÑŒ Ñ€Ð°Ð½ÑŒÑˆÐµ ÐºÐ¾Ð½Ñ†Ð°."
         with atomic() as db:
             ok = TimeSlotRepo.insert(db, start, end)
         if not ok:
-            return False, f"Слот {start} уже существует."
+            return False, f"Ð¡Ð»Ð¾Ñ‚ {start} ÑƒÐ¶Ðµ ÑÑƒÑ‰ÐµÑÑ‚Ð²ÑƒÐµÑ‚."
         self.sync()
         return True, ""
 
     def toggle(self, start: str, active: bool) -> tuple[bool, str]:
-        """Включить / выключить слот."""
+        """Ð’ÐºÐ»ÑŽÑ‡Ð¸Ñ‚ÑŒ / Ð²Ñ‹ÐºÐ»ÑŽÑ‡Ð¸Ñ‚ÑŒ ÑÐ»Ð¾Ñ‚."""
         with atomic() as db:
             TimeSlotRepo.set_active(db, start, active)
         self.sync()
         return True, ""
 
     def delete(self, start: str) -> tuple[bool, str]:
-        # Проверяем активные записи на этот слот
+        # ÐŸÑ€Ð¾Ð²ÐµÑ€ÑÐµÐ¼ Ð°ÐºÑ‚Ð¸Ð²Ð½Ñ‹Ðµ Ð·Ð°Ð¿Ð¸ÑÐ¸ Ð½Ð° ÑÑ‚Ð¾Ñ‚ ÑÐ»Ð¾Ñ‚
         with get_db() as db:
             count = db.execute(
                 "SELECT COUNT(*) FROM bookings WHERE time=? AND status='active'",
                 (start,),
             ).fetchone()[0]
         if count > 0:
-            return False, f"Нельзя удалить: есть {count} активных записей на {start}."
+            return False, f"ÐÐµÐ»ÑŒÐ·Ñ ÑƒÐ´Ð°Ð»Ð¸Ñ‚ÑŒ: ÐµÑÑ‚ÑŒ {count} Ð°ÐºÑ‚Ð¸Ð²Ð½Ñ‹Ñ… Ð·Ð°Ð¿Ð¸ÑÐµÐ¹ Ð½Ð° {start}."
         with atomic() as db:
             TimeSlotRepo.delete(db, start)
         self.sync()
         return True, ""
 
-# ════════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # BlacklistService
-# ════════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 
 class BlacklistService:
@@ -588,12 +748,12 @@ class BlacklistService:
             return BlacklistRepo.all(db)
 
 class PortfolioService:
-    """Сервис портфолио — фото работ мастера.
-    Использует единственное WAL-соединение через get_db()/atomic().
+    """Ð¡ÐµÑ€Ð²Ð¸Ñ Ð¿Ð¾Ñ€Ñ‚Ñ„Ð¾Ð»Ð¸Ð¾ â€” Ñ„Ð¾Ñ‚Ð¾ Ñ€Ð°Ð±Ð¾Ñ‚ Ð¼Ð°ÑÑ‚ÐµÑ€Ð°.
+    Ð˜ÑÐ¿Ð¾Ð»ÑŒÐ·ÑƒÐµÑ‚ ÐµÐ´Ð¸Ð½ÑÑ‚Ð²ÐµÐ½Ð½Ð¾Ðµ WAL-ÑÐ¾ÐµÐ´Ð¸Ð½ÐµÐ½Ð¸Ðµ Ñ‡ÐµÑ€ÐµÐ· get_db()/atomic().
     """
 
     def __init__(self, db_path: str = ""):
-        pass  # db_path для обратной совместимости
+        pass  # db_path Ð´Ð»Ñ Ð¾Ð±Ñ€Ð°Ñ‚Ð½Ð¾Ð¹ ÑÐ¾Ð²Ð¼ÐµÑÑ‚Ð¸Ð¼Ð¾ÑÑ‚Ð¸
 
     def all(self) -> list[dict]:
         with get_db() as db:
@@ -603,7 +763,7 @@ class PortfolioService:
         with get_db() as db:
             count = PortfolioRepo.count(db)
         if count >= PortfolioRepo.MAX_PHOTOS:
-            return False, f"Максимум {PortfolioRepo.MAX_PHOTOS} фото. Удалите лишние."
+            return False, f"ÐœÐ°ÐºÑÐ¸Ð¼ÑƒÐ¼ {PortfolioRepo.MAX_PHOTOS} Ñ„Ð¾Ñ‚Ð¾. Ð£Ð´Ð°Ð»Ð¸Ñ‚Ðµ Ð»Ð¸ÑˆÐ½Ð¸Ðµ."
         with atomic() as db:
             PortfolioRepo.add_atomic(db, file_id)
         return True, ""
@@ -615,3 +775,4 @@ class PortfolioService:
     def count(self) -> int:
         with get_db() as db:
             return PortfolioRepo.count(db)
+

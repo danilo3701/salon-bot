@@ -8,8 +8,10 @@ app/bot/handlers/master.py  — v13
 from __future__ import annotations
 
 import logging
+import re
+from datetime import date as dt_date, timedelta
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackContext
 
 from app.bot.helpers import (
@@ -39,15 +41,111 @@ def register_steps(dispatcher):
     dispatcher.register("about_contact",  _step_about_contact)
     dispatcher.register("slot_add_start", _step_slot_start)
     dispatcher.register("slot_add_end",   _step_slot_end)
+    dispatcher.register("ads_add_time_input", _step_ads_add_time_input)
+    dispatcher.register("ads_add_period_input", _step_ads_add_period_input)
     dispatcher.register("about_photo",    _step_about_photo)
     dispatcher.register("portfolio_add",  _step_portfolio_add)
 
 
 K_TIMESLOT = "svc_timeslot"
+K_WEEKLY_SCHEDULE = "svc_weekly_schedule"
 
 
 def _tsvc(context):
     return svc(context, K_TIMESLOT)
+
+
+def _wsvc(context):
+    return svc(context, K_WEEKLY_SCHEDULE)
+
+
+_WD_SHORT = {
+    1: "Пн",
+    2: "Вт",
+    3: "Ср",
+    4: "Чт",
+    5: "Пт",
+    6: "Сб",
+    7: "Вс",
+}
+_WD_FULL = {
+    1: "ПОНЕДЕЛЬНИК",
+    2: "ВТОРНИК",
+    3: "СРЕДА",
+    4: "ЧЕТВЕРГ",
+    5: "ПЯТНИЦА",
+    6: "СУББОТА",
+    7: "ВОСКРЕСЕНЬЕ",
+}
+
+
+def _cb_ads_root() -> str:
+    return "ads:root"
+
+
+def _cb_ads_wd(weekday: int) -> str:
+    return f"ads:wd:{weekday}"
+
+
+def _cb_ads_add(weekday: int) -> str:
+    return f"ads:add:{weekday}"
+
+
+def _cb_ads_rm(weekday: int, hhmm: str) -> str:
+    return f"ads:rm:{weekday}:{hhmm.replace(':', '')}"
+
+
+def _cb_ads_rmok(weekday: int, hhmm: str) -> str:
+    return f"ads:rmok:{weekday}:{hhmm.replace(':', '')}"
+
+
+def _cb_ads_day(weekday: int, is_open: bool) -> str:
+    return f"ads:day:{weekday}:{1 if is_open else 0}"
+
+
+def _cb_ads_dayok(weekday: int, is_open: bool, ok: bool) -> str:
+    return f"ads:dayok:{weekday}:{1 if is_open else 0}:{1 if ok else 0}"
+
+
+def _cb_ads_per(weekday: int, is_closed: bool) -> str:
+    return f"ads:per:{weekday}:{1 if is_closed else 0}"
+
+
+def _from_hhmm_token(token: str) -> str | None:
+    if not token or not token.isdigit() or len(token) != 4:
+        return None
+    hh = int(token[:2])
+    mm = int(token[2:])
+    if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+        return None
+    return f"{hh:02d}:{mm:02d}"
+
+
+def _normalize_hhmm(raw: str) -> str | None:
+    text = (raw or "").strip().replace(".", ":")
+    if text and text.count(":") == 1:
+        a, b = text.split(":")
+        if a.isdigit() and b.isdigit():
+            text = f"{int(a):02d}:{int(b):02d}"
+    if not re.match(r"^\d{2}:\d{2}$", text):
+        return None
+    hh = int(text[:2])
+    mm = int(text[3:])
+    if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+        return None
+    return text
+
+
+def _normalize_period(raw: str) -> tuple[str, str] | None:
+    text = (raw or "").strip().replace("–", "-").replace("—", "-")
+    if "-" not in text:
+        return None
+    left, right = text.split("-", 1)
+    start = _normalize_hhmm(left)
+    end = _normalize_hhmm(right)
+    if not start or not end or start >= end:
+        return None
+    return start, end
 
 
 def _is_admin(update: Update) -> bool:
@@ -138,43 +236,53 @@ async def adm_today(update: Update, context: CallbackContext):
 async def _show_day(update, context, date_str: str,
                     back_label: str = "◀️ Календарь",
                     back_cb:    str = "adm_calendar"):
-    """Единый рендер дня: слоты + управление."""
     day_info = svc(context, K_BOOKING).slots_for_day(date_str)
-    rows     = svc(context, K_BOOKING).by_date(date_str)
+    rows = svc(context, K_BOOKING).by_date(date_str)
+    booked_by_time = {b.time: b for b in rows}
 
-    lines   = [f"📅 <b>{fmt_date(date_str)}</b>\n"]
-    buttons = []
+    free_count = len([x for x in day_info["slots"] if x["status"] == "free"])
+    blocked_count = len([x for x in day_info["slots"] if x["status"] == "blocked"])
+    booked_count = len([x for x in day_info["slots"] if x["status"] == "booked"])
+
+    lines = [
+        f"📅 <b>{fmt_date(date_str)}</b>",
+        "",
+        f"🟢 Свободно: {free_count}  🔒 Закрыто: {blocked_count}  📌 Записей: {booked_count}",
+        "",
+    ]
+    buttons: list[tuple[str, str]] = []
+
+    for slot_info in day_info["slots"]:
+        slot = slot_info["time"]
+        status = slot_info["status"]
+        booking = booked_by_time.get(slot)
+        if status == "booked" and booking:
+            client = svc(context, K_CLIENT).get(booking.user_id)
+            name = client.display_name if client else "—"
+            lines.append(f"📌 {slot} — {name}")
+            buttons.append((f"❌ Отменить {slot}", f"adm_cancel_{booking.id}"))
+        elif status == "blocked":
+            lines.append(f"🔒 {slot} — закрыто")
+            buttons.append((f"🔓 Открыть {slot}", f"adm_slot_on_{date_str}_{slot}"))
+        else:
+            lines.append(f"🟢 {slot} — свободно")
+            buttons.append((f"🔒 Закрыть {slot}", f"adm_slot_off_{date_str}_{slot}"))
 
     if day_info["day_blocked"]:
-        lines.append("🚫 <i>День полностью закрыт</i>\n")
         buttons.append(("✅ Открыть весь день", f"adm_day_open_{date_str}"))
     else:
-        for slot_info in day_info["slots"]:
-            slot    = slot_info["time"]
-            status  = slot_info["status"]
-            booking = next((b for b in rows if b.time == slot), None)
+        buttons.append(("🚫 Закрыть весь день", f"adm_day_close_{date_str}"))
 
-            if status == "booked" and booking:
-                client = svc(context, K_CLIENT).get(booking.user_id)
-                name   = client.display_name if client else "—"
-                phone  = client.phone        if client else "—"
-                lines.append(
-                    f"⏰ <b>{fmt_slot(slot)}</b>\n"
-                    f"   👤 {name}  📞 {phone}\n"
-                    f"   💅 {booking.service}\n"
-                )
-                buttons.append((f"❌ Отменить {slot}", f"adm_cancel_{booking.id}"))
-            elif status == "blocked":
-                lines.append(f"🔒 {fmt_slot(slot)}  —  закрыт\n")
-                buttons.append((f"🔓 Открыть {slot}", f"adm_slot_on_{date_str}_{slot}"))
-            else:
-                lines.append(f"✅ {fmt_slot(slot)}  —  свободно\n")
-                buttons.append((f"🔒 Закрыть {slot}", f"adm_slot_off_{date_str}_{slot}"))
+    weekday = dt_date.fromisoformat(date_str).isoweekday()
+    day_obj = dt_date.fromisoformat(date_str)
+    prev_day = (day_obj - timedelta(days=1)).isoformat()
+    next_day = (day_obj + timedelta(days=1)).isoformat()
+    buttons.append(("🧩 Шаблон этого дня", _cb_ads_wd(weekday)))
+    buttons.append(("◀️ Календарь", "adm_calendar"))
+    buttons.append(("◀️ День-1", f"calnav_{prev_day}"))
+    buttons.append(("День+1 ▶️", f"calnav_{next_day}"))
 
-        buttons.append((f"🚫 Закрыть весь день", f"adm_day_close_{date_str}"))
-
-    msg = "\n".join(lines)
-    await edit_or_reply(update, msg, kb(buttons + [(back_label, back_cb)]))
+    await edit_or_reply(update, "\n".join(lines), kb(buttons, cols=2))
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -256,6 +364,12 @@ async def adm_calendar_week(update: Update, context: CallbackContext):
 async def adm_calendar_day(update: Update, context: CallbackContext):
     await update.callback_query.answer()
     date_str = update.callback_query.data.replace("calday_", "")
+    await _show_day(update, context, date_str)
+
+
+async def adm_calendar_day_nav(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    date_str = update.callback_query.data.replace("calnav_", "")
     await _show_day(update, context, date_str)
 
 
@@ -830,6 +944,315 @@ async def adm_slot_delete_yes(update: Update, context: CallbackContext):
 # ════════════════════════════════════════════════════════════════════════════════
 # О МАСТЕРЕ
 # ════════════════════════════════════════════════════════════════════════════════
+
+def _ads_weekday_picker_markup() -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton("Пн", callback_data=_cb_ads_wd(1)),
+            InlineKeyboardButton("Вт", callback_data=_cb_ads_wd(2)),
+            InlineKeyboardButton("Ср", callback_data=_cb_ads_wd(3)),
+        ],
+        [
+            InlineKeyboardButton("Чт", callback_data=_cb_ads_wd(4)),
+            InlineKeyboardButton("Пт", callback_data=_cb_ads_wd(5)),
+            InlineKeyboardButton("Сб", callback_data=_cb_ads_wd(6)),
+        ],
+        [
+            InlineKeyboardButton("Вс", callback_data=_cb_ads_wd(7)),
+            InlineKeyboardButton("◀️ Меню мастера", callback_data="master_menu"),
+        ],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _ads_group_times(times: list[str]) -> list[list[str]]:
+    morning = [t for t in times if int(t[:2]) < 12]
+    noon = [t for t in times if 12 <= int(t[:2]) <= 18]
+    evening = [t for t in times if int(t[:2]) > 18 or int(t[:2]) < 3]
+    return [morning, noon, evening]
+
+
+def _ads_time_in_closed(day: dict, hhmm: str) -> bool:
+    if not day.get("closed_start") or not day.get("closed_end"):
+        return False
+    return day["closed_start"] <= hhmm < day["closed_end"]
+
+
+def _ads_day_markup(weekday: int, day: dict) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    chips: list[InlineKeyboardButton] = []
+    for hhmm in day["times"]:
+        blocked = (not day["is_open"]) or _ads_time_in_closed(day, hhmm)
+        icon = "🚫" if blocked else "🕒"
+        chips.append(InlineKeyboardButton(
+            text=f"{icon} {hhmm}",
+            callback_data=_cb_ads_rm(weekday, hhmm),
+        ))
+    for i in range(0, len(chips), 4):
+        rows.append(chips[i:i + 4])
+    rows.append([InlineKeyboardButton("➕ Добавить время", callback_data=_cb_ads_add(weekday))])
+
+    day_target = not day["is_open"]
+    day_label = "🔓 Открыть день" if day_target else "🔒 Закрыть день"
+    has_period = bool(day.get("closed_start") and day.get("closed_end"))
+    per_label = "✅ Открыть период" if has_period else "🚫 Закрыть период"
+    per_target_closed = not has_period
+    rows.append([
+        InlineKeyboardButton(day_label, callback_data=_cb_ads_day(weekday, day_target)),
+        InlineKeyboardButton(per_label, callback_data=_cb_ads_per(weekday, per_target_closed)),
+    ])
+    rows.append([
+        InlineKeyboardButton("◀️ Назад", callback_data=_cb_ads_root()),
+        InlineKeyboardButton("🏠 Меню", callback_data="master_menu"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _ads_render_day(update: Update, context: CallbackContext, weekday: int, note: str = ""):
+    day = _wsvc(context).get_day_template(weekday)
+    groups = _ads_group_times(day["times"])
+    lines = [
+        f"📅 <b>{_WD_FULL.get(weekday, str(weekday))}</b> (шаблон)",
+        f"🎛 Режим: мастер",
+        f"🕒 Таймзона: {settings.TIMEZONE}",
+        f"📌 Статус: {'✅ День открыт' if day['is_open'] else '⛔ День закрыт (слоты скрыты)'}",
+    ]
+    if day.get("closed_start") and day.get("closed_end"):
+        lines.append(f"🚫 Закрытый период: {day['closed_start']}–{day['closed_end']}")
+    lines.append("")
+    lines.append("Времена:")
+    if day["times"]:
+        lines.append("до 12:00    до 18:00    после 18:00")
+        max_len = max(len(groups[0]), len(groups[1]), len(groups[2]))
+        for i in range(max_len):
+            c1 = groups[0][i] if i < len(groups[0]) else ""
+            c2 = groups[1][i] if i < len(groups[1]) else ""
+            c3 = groups[2][i] if i < len(groups[2]) else ""
+            lines.append(f"{c1:<10}{c2:<10}{c3}")
+    else:
+        lines.append("—")
+    if note:
+        lines.append("")
+        lines.append(note)
+    await edit_or_reply(update, "\n".join(lines), _ads_day_markup(weekday, day))
+
+
+async def _ads_redirect_notice(update: Update, context: CallbackContext, note: str):
+    await ads_root(update, context, notice=f"ℹ️ {note}")
+
+
+async def ads_root(update: Update, context: CallbackContext, notice: str = ""):
+    await update.callback_query.answer()
+    text = (
+        "⏰ <b>Расписание</b>\n"
+        "Выберите день недели (шаблон):\n"
+        f"Таймзона: {settings.TIMEZONE}"
+    )
+    if notice:
+        text += f"\n\n{notice}"
+    await edit_or_reply(update, text, _ads_weekday_picker_markup())
+
+
+async def ads_wd(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    parts = update.callback_query.data.split(":")
+    if len(parts) != 3:
+        await update.callback_query.answer("Некорректный callback", show_alert=True)
+        return
+    try:
+        weekday = int(parts[2])
+    except ValueError:
+        await update.callback_query.answer("Некорректный день", show_alert=True)
+        return
+    if weekday < 1 or weekday > 7:
+        await update.callback_query.answer("День 1..7", show_alert=True)
+        return
+    await _ads_render_day(update, context, weekday)
+
+
+async def ads_add(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    parts = update.callback_query.data.split(":")
+    if len(parts) != 3:
+        await update.callback_query.answer("Некорректный callback", show_alert=True)
+        return
+    weekday = int(parts[2])
+    context.user_data["ads_weekday"] = weekday
+    set_step(context.user_data, "ads_add_time_input")
+    await edit_or_reply(
+        update,
+        "Введите время в формате ЧЧ:ММ\nПример: 10:00",
+        kb([("◀️ Назад", _cb_ads_wd(weekday)), ("🏠 Меню", "master_menu")], cols=2),
+    )
+
+
+async def _step_ads_add_time_input(update: Update, context: CallbackContext):
+    weekday = int(context.user_data.get("ads_weekday") or 0)
+    hhmm = _normalize_hhmm(update.message.text or "")
+    if weekday < 1 or weekday > 7:
+        set_step(context.user_data, None)
+        await update.message.reply_text("Сессия истекла.", reply_markup=kb([("🏠 Меню", "master_menu")]))
+        return
+    if not hhmm:
+        await update.message.reply_text("⚠️ Формат времени: ЧЧ:ММ.")
+        return
+    ok, msg = _wsvc(context).add_weekly_time(weekday, hhmm)
+    set_step(context.user_data, None)
+    if not ok:
+        await update.message.reply_text(f"⚠️ {msg}", reply_markup=kb([("◀️ К дню", _cb_ads_wd(weekday))]))
+        return
+    await update.message.reply_text(f"✅ Добавлено: {msg}", reply_markup=kb([("◀️ К дню", _cb_ads_wd(weekday))]))
+
+
+async def ads_rm(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    parts = update.callback_query.data.split(":")
+    if len(parts) != 4:
+        await update.callback_query.answer("Некорректный callback", show_alert=True)
+        return
+    weekday = int(parts[2])
+    hhmm = _from_hhmm_token(parts[3])
+    if not hhmm:
+        await update.callback_query.answer("Некорректное время", show_alert=True)
+        return
+    await edit_or_reply(
+        update,
+        f"Удалить {hhmm}?",
+        kb([
+            ("✅ Да, удалить", _cb_ads_rmok(weekday, hhmm)),
+            ("◀️ Нет", _cb_ads_wd(weekday)),
+            ("🏠 Меню", "master_menu"),
+        ]),
+    )
+
+
+async def ads_rmok(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    parts = update.callback_query.data.split(":")
+    if len(parts) != 4:
+        await update.callback_query.answer("Некорректный callback", show_alert=True)
+        return
+    weekday = int(parts[2])
+    hhmm = _from_hhmm_token(parts[3])
+    if not hhmm:
+        await update.callback_query.answer("Некорректное время", show_alert=True)
+        return
+    _wsvc(context).remove_weekly_time(weekday, hhmm)
+    await _ads_render_day(update, context, weekday, f"✅ Удалено: {hhmm}")
+
+
+async def ads_day(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    parts = update.callback_query.data.split(":")
+    if len(parts) != 4:
+        await update.callback_query.answer("Некорректный callback", show_alert=True)
+        return
+    weekday = int(parts[2])
+    target_open = parts[3] == "1"
+    action = "открыть" if target_open else "закрыть"
+    await edit_or_reply(
+        update,
+        f"Подтвердите: {action} день {_WD_SHORT.get(weekday, weekday)}?",
+        kb([
+            ("✅ Да", _cb_ads_dayok(weekday, target_open, True)),
+            ("◀️ Отмена", _cb_ads_wd(weekday)),
+        ], cols=2),
+    )
+
+
+async def ads_dayok(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    parts = update.callback_query.data.split(":")
+    if len(parts) != 5:
+        await update.callback_query.answer("Некорректный callback", show_alert=True)
+        return
+    weekday = int(parts[2])
+    target_open = parts[3] == "1"
+    is_ok = parts[4] == "1"
+    if not is_ok:
+        await _ads_render_day(update, context, weekday)
+        return
+    ok, msg = _wsvc(context).toggle_day_open(weekday, target_open)
+    if not ok:
+        await _ads_render_day(update, context, weekday, f"⚠️ {msg}")
+        return
+    await _ads_render_day(update, context, weekday, "✅ Статус дня обновлен")
+
+
+async def ads_per(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    parts = update.callback_query.data.split(":")
+    if len(parts) != 4:
+        await update.callback_query.answer("Некорректный callback", show_alert=True)
+        return
+    weekday = int(parts[2])
+    to_closed = parts[3] == "1"
+    if not to_closed:
+        _wsvc(context).clear_closed_period(weekday)
+        await _ads_render_day(update, context, weekday, "✅ Период открыт")
+        return
+    context.user_data["ads_weekday"] = weekday
+    set_step(context.user_data, "ads_add_period_input")
+    await edit_or_reply(
+        update,
+        "Введите закрытый период в формате ЧЧ:ММ-ЧЧ:ММ\nПример: 14:00-16:00",
+        kb([("◀️ Назад", _cb_ads_wd(weekday)), ("🏠 Меню", "master_menu")], cols=2),
+    )
+
+
+async def _step_ads_add_period_input(update: Update, context: CallbackContext):
+    weekday = int(context.user_data.get("ads_weekday") or 0)
+    parsed = _normalize_period(update.message.text or "")
+    if weekday < 1 or weekday > 7:
+        set_step(context.user_data, None)
+        await update.message.reply_text("Сессия истекла.", reply_markup=kb([("🏠 Меню", "master_menu")]))
+        return
+    if not parsed:
+        await update.message.reply_text("⚠️ Формат периода: ЧЧ:ММ-ЧЧ:ММ.")
+        return
+    ok, msg = _wsvc(context).set_closed_period(weekday, parsed[0], parsed[1])
+    set_step(context.user_data, None)
+    if not ok:
+        await update.message.reply_text(f"⚠️ {msg}", reply_markup=kb([("◀️ К дню", _cb_ads_wd(weekday))]))
+        return
+    await update.message.reply_text(f"✅ Период установлен: {msg}", reply_markup=kb([("◀️ К дню", _cb_ads_wd(weekday))]))
+
+
+async def adm_schedule(update: Update, context: CallbackContext):
+    await ads_root(update, context)
+
+
+async def adm_sched_add(update: Update, context: CallbackContext):
+    await _ads_redirect_notice(update, context, "Старый callback перенаправлен в новое расписание")
+
+
+async def adm_sched_toggle(update: Update, context: CallbackContext):
+    await _ads_redirect_notice(update, context, "Старый callback перенаправлен в новое расписание")
+
+
+async def adm_sched_delete(update: Update, context: CallbackContext):
+    await _ads_redirect_notice(update, context, "Старый callback перенаправлен в новое расписание")
+
+
+async def adm_sched_delete_yes(update: Update, context: CallbackContext):
+    await _ads_redirect_notice(update, context, "Старый callback перенаправлен в новое расписание")
+
+
+async def adm_slot_add(update: Update, context: CallbackContext):
+    await _ads_redirect_notice(update, context, "Старый callback перенаправлен в новое расписание")
+
+
+async def adm_slot_toggle(update: Update, context: CallbackContext):
+    await _ads_redirect_notice(update, context, "Старый callback перенаправлен в новое расписание")
+
+
+async def adm_slot_delete(update: Update, context: CallbackContext):
+    await _ads_redirect_notice(update, context, "Старый callback перенаправлен в новое расписание")
+
+
+async def adm_slot_delete_yes(update: Update, context: CallbackContext):
+    await _ads_redirect_notice(update, context, "Старый callback перенаправлен в новое расписание")
+
 
 async def adm_about(update: Update, context: CallbackContext):
     await update.callback_query.answer()

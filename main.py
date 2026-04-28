@@ -39,6 +39,7 @@ from app.services.reminder_guard import send_with_mark
 from app.services.services import (
     BlacklistService, BookingService, ClientService,
     NoteService, PortfolioService, ReviewService, ServiceService, TimeSlotService,
+    WeeklyScheduleService,
 )
 
 logger: logging.Logger
@@ -284,6 +285,7 @@ def build_application() -> Application:
     app.bot_data[K_SERVICE]      = ServiceService()
     app.bot_data[K_PORTFOLIO]    = PortfolioService(settings.DB_PATH)
     app.bot_data["svc_timeslot"] = TimeSlotService()
+    app.bot_data["svc_weekly_schedule"] = WeeklyScheduleService()
     app.bot_data[K_LIMITERS]     = Limiters(settings)
     app.bot_data[K_DISPATCH]     = dispatcher
 
@@ -377,6 +379,7 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(mh.adm_calendar,       pattern="^adm_calendar$"))
     app.add_handler(CallbackQueryHandler(mh.adm_calendar_week,  pattern=r"^cal_week_\d+$"))
     app.add_handler(CallbackQueryHandler(mh.adm_calendar_day,   pattern=r"^calday_\d{4}-\d{2}-\d{2}$"))
+    app.add_handler(CallbackQueryHandler(mh.adm_calendar_day_nav, pattern=r"^calnav_\d{4}-\d{2}-\d{2}$"))
     app.add_handler(CallbackQueryHandler(mh.adm_cancel_booking, pattern=r"^adm_cancel_\d+$"))
     app.add_handler(CallbackQueryHandler(mh.adm_cancel_confirmed,pattern=r"^adm_cancel_yes_\d+$"))
     app.add_handler(CallbackQueryHandler(mh.adm_rconfirm,       pattern=r"^adm_rconfirm_\d+$"))
@@ -413,6 +416,14 @@ def build_application() -> Application:
     # Старые adm_slot_* сохранены для обратной совместимости.
     # ════════════════════════════════════════════════════════════════════════
     app.add_handler(CallbackQueryHandler(mh.adm_schedule,         pattern="^adm_schedule$"))
+    app.add_handler(CallbackQueryHandler(mh.ads_root,             pattern=r"^ads:root$"))
+    app.add_handler(CallbackQueryHandler(mh.ads_wd,               pattern=r"^ads:wd:[1-7]$"))
+    app.add_handler(CallbackQueryHandler(mh.ads_add,              pattern=r"^ads:add:[1-7]$"))
+    app.add_handler(CallbackQueryHandler(mh.ads_rm,               pattern=r"^ads:rm:[1-7]:\d{4}$"))
+    app.add_handler(CallbackQueryHandler(mh.ads_rmok,             pattern=r"^ads:rmok:[1-7]:\d{4}$"))
+    app.add_handler(CallbackQueryHandler(mh.ads_day,              pattern=r"^ads:day:[1-7]:[01]$"))
+    app.add_handler(CallbackQueryHandler(mh.ads_dayok,            pattern=r"^ads:dayok:[1-7]:[01]:[01]$"))
+    app.add_handler(CallbackQueryHandler(mh.ads_per,              pattern=r"^ads:per:[1-7]:[01]$"))
     # Новые callback
     app.add_handler(CallbackQueryHandler(mh.adm_sched_add,        pattern="^adm_sched_add$"))
     app.add_handler(CallbackQueryHandler(mh.adm_sched_toggle,     pattern=r"^adm_sched_toggle_(on|off)_\d{2}:\d{2}$"))

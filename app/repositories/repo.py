@@ -566,6 +566,110 @@ class TimeSlotRepo:
 
 # ── BlockedSlotRepo ───────────────────────────────────────────────────────────
 
+class WeeklyScheduleRepo:
+
+    @staticmethod
+    def ensure_day(db: sqlite3.Connection, weekday: int):
+        db.execute(
+            "INSERT OR IGNORE INTO weekly_day_templates (weekday, is_open) VALUES (?, 1)",
+            (weekday,),
+        )
+
+    @staticmethod
+    def get_day_template(db: sqlite3.Connection, weekday: int) -> dict:
+        WeeklyScheduleRepo.ensure_day(db, weekday)
+        row = db.execute(
+            "SELECT weekday, is_open, closed_start, closed_end "
+            "FROM weekly_day_templates WHERE weekday=?",
+            (weekday,),
+        ).fetchone()
+        trows = db.execute(
+            "SELECT hhmm FROM weekly_day_times WHERE weekday=? ORDER BY sort_order, hhmm",
+            (weekday,),
+        ).fetchall()
+        return {
+            "weekday": weekday,
+            "is_open": bool(row["is_open"]) if row else True,
+            "closed_start": row["closed_start"] if row else None,
+            "closed_end": row["closed_end"] if row else None,
+            "times": [r["hhmm"] for r in trows],
+        }
+
+    @staticmethod
+    def all_day_templates(db: sqlite3.Connection) -> list[dict]:
+        rows = db.execute(
+            "SELECT weekday, is_open, closed_start, closed_end "
+            "FROM weekly_day_templates ORDER BY weekday"
+        ).fetchall()
+        out: list[dict] = []
+        for row in rows:
+            trows = db.execute(
+                "SELECT hhmm FROM weekly_day_times WHERE weekday=? ORDER BY sort_order, hhmm",
+                (row["weekday"],),
+            ).fetchall()
+            out.append({
+                "weekday": row["weekday"],
+                "is_open": bool(row["is_open"]),
+                "closed_start": row["closed_start"],
+                "closed_end": row["closed_end"],
+                "times": [r["hhmm"] for r in trows],
+            })
+        return out
+
+    @staticmethod
+    def add_time(db: sqlite3.Connection, weekday: int, hhmm: str) -> bool:
+        WeeklyScheduleRepo.ensure_day(db, weekday)
+        try:
+            max_order = db.execute(
+                "SELECT COALESCE(MAX(sort_order), -1) FROM weekly_day_times WHERE weekday=?",
+                (weekday,),
+            ).fetchone()[0]
+            db.execute(
+                "INSERT INTO weekly_day_times (weekday, hhmm, sort_order) VALUES (?,?,?)",
+                (weekday, hhmm, max_order + 1),
+            )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    @staticmethod
+    def remove_time(db: sqlite3.Connection, weekday: int, hhmm: str):
+        db.execute(
+            "DELETE FROM weekly_day_times WHERE weekday=? AND hhmm=?",
+            (weekday, hhmm),
+        )
+
+    @staticmethod
+    def set_day_open(db: sqlite3.Connection, weekday: int, is_open: bool):
+        WeeklyScheduleRepo.ensure_day(db, weekday)
+        db.execute(
+            "UPDATE weekly_day_templates "
+            "SET is_open=?, updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+            "WHERE weekday=?",
+            (1 if is_open else 0, weekday),
+        )
+
+    @staticmethod
+    def set_closed_period(db: sqlite3.Connection, weekday: int, start: str, end: str):
+        WeeklyScheduleRepo.ensure_day(db, weekday)
+        db.execute(
+            "UPDATE weekly_day_templates "
+            "SET closed_start=?, closed_end=?, updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+            "WHERE weekday=?",
+            (start, end, weekday),
+        )
+
+    @staticmethod
+    def clear_closed_period(db: sqlite3.Connection, weekday: int):
+        WeeklyScheduleRepo.ensure_day(db, weekday)
+        db.execute(
+            "UPDATE weekly_day_templates "
+            "SET closed_start=NULL, closed_end=NULL, updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+            "WHERE weekday=?",
+            (weekday,),
+        )
+
+
 class BlockedSlotRepo:
 
     @staticmethod
