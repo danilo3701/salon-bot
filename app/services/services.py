@@ -30,11 +30,11 @@ from app.core.time_utils import (
 )
 from app.models.domain import (
     Booking, BookingResult, BookingStatus, Client, ClientCard,
-    Note, RescheduleRequest, Review, SlotInfo, Stats,
+    BookingEvent, Note, RescheduleRequest, Review, SlotInfo, Stats,
 )
 from app.repositories.repo import (
     BlacklistRepo, BlockedDayRepo, BlockedSlotRepo, BookingRepo, ClientRepo,
-    NoteRepo, PortfolioRepo, RescheduleRepo, ReviewRepo, ServiceRepo, TimeSlotRepo,
+    BookingEventRepo, NoteRepo, PortfolioRepo, RescheduleRepo, ReviewRepo, ServiceRepo, TimeSlotRepo,
     WeeklyScheduleRepo,
 )
 from app.services.excel_worker import ExcelRow, enqueue
@@ -300,6 +300,14 @@ class BookingService:
         with get_db() as db:
             return BookingRepo.user_past(db, user_id, local_today().isoformat())
 
+    def future_active(self) -> list[Booking]:
+        with get_db() as db:
+            return BookingRepo.future(db, local_today().isoformat())
+
+    def events(self, booking_id: int, limit: int = 30) -> list[BookingEvent]:
+        with get_db() as db:
+            return BookingEventRepo.by_booking(db, booking_id, limit)
+
     def free_slots(self, date: str) -> list[str]:
         with get_db() as db:
             if BlockedDayRepo.is_blocked(db, date):
@@ -445,6 +453,11 @@ class BookingService:
                               f"ÐžÑ‚Ð¼ÐµÐ½Ð¸Ñ‚Ðµ Ð¾Ð´Ð½Ñƒ Ð¸Ð· ÑÑƒÑ‰ÐµÑÑ‚Ð²ÑƒÑŽÑ‰Ð¸Ñ…, Ñ‡Ñ‚Ð¾Ð±Ñ‹ ÑÐ¾Ð·Ð´Ð°Ñ‚ÑŒ Ð½Ð¾Ð²ÑƒÑŽ.",
                     )
                 bid     = BookingRepo.insert(db, user_id, service, price, date, time)
+                BookingRepo.set_confirmed(db, bid, False)
+                BookingEventRepo.insert(
+                    db, bid, "created", f"client:{user_id}",
+                    f"{date} {time} | {service}",
+                )
                 booking = BookingRepo.get(db, bid)
             client = self._get_client_name(user_id)
             enqueue(ExcelRow("Ð·Ð°Ð¿Ð¸ÑÑŒ", client[0], client[1],
@@ -468,6 +481,11 @@ class BookingService:
             with atomic() as db:
                 BookingRepo.set_status(db, bid, BookingStatus.CANCELLED)
                 RescheduleRepo.delete_by_booking(db, bid)
+                actor = "admin" if by_user in settings.ADMIN_IDS else "client"
+                BookingEventRepo.insert(
+                    db, bid, "cancelled", f"{actor}:{by_user}",
+                    f"{booking.date} {booking.time} | {booking.service}",
+                )
             client = self._get_client_name(booking.user_id)
             enqueue(ExcelRow("Ð¾Ñ‚Ð¼ÐµÐ½Ð°", client[0], client[1],
                              booking.service, booking.date, booking.time, 0, "cancelled"))
@@ -495,8 +513,16 @@ class BookingService:
                 booked = BookingRepo.booked_times(db, rr.new_date)
                 if rr.new_time in booked:
                     return BookingResult(ok=False, error="Ð¡Ð»Ð¾Ñ‚ ÑƒÐ¶Ðµ Ð·Ð°Ð½ÑÑ‚.")
+                old_date, old_time = booking.date, booking.time
                 BookingRepo.set_slot(db, booking_id, rr.new_date, rr.new_time)
                 RescheduleRepo.delete(db, rr.id)
+                BookingEventRepo.insert(
+                    db,
+                    booking_id,
+                    "rescheduled",
+                    "admin",
+                    f"{old_date} {old_time} -> {rr.new_date} {rr.new_time}",
+                )
                 updated = BookingRepo.get(db, booking_id)
             return BookingResult(ok=True, booking=updated)
         except Exception as e:
@@ -513,6 +539,73 @@ class BookingService:
         with atomic() as db:
             RescheduleRepo.create(db, booking_id, new_date, new_time, expires)
         return True
+
+    def reschedule_by_client(self, booking_id: int, by_user: int, new_date: str, new_time: str) -> BookingResult:
+        with get_db() as db:
+            booking = BookingRepo.get(db, booking_id)
+        if not booking:
+            return BookingResult(ok=False, error="Запись не найдена.")
+        is_admin = by_user in settings.ADMIN_IDS
+        if booking.user_id != by_user and not is_admin:
+            return BookingResult(ok=False, error="Нет прав для переноса.")
+        if booking.status != BookingStatus.ACTIVE:
+            return BookingResult(ok=False, error="Перенос доступен только для активной записи.")
+        if booking.date < local_today().isoformat():
+            return BookingResult(ok=False, error="Прошедшую запись перенести нельзя.")
+        new_time = _normalize_hhmm(new_time or "") or (new_time or "")
+        if booking.date == new_date and booking.time == new_time:
+            return BookingResult(ok=False, error="Выберите другое время для переноса.")
+
+        try:
+            with atomic() as db:
+                day_times = self._weekly.times_for_date(new_date, db=db)
+                if new_time not in day_times:
+                    return BookingResult(ok=False, error="Это время недоступно в расписании.")
+                if BlockedDayRepo.is_blocked(db, new_date):
+                    return BookingResult(ok=False, error="День закрыт для записи.")
+                if new_time in BlockedSlotRepo.blocked_for_date(db, new_date):
+                    return BookingResult(ok=False, error="Этот слот недоступен.")
+                booked = BookingRepo.booked_times(db, new_date)
+                if new_time in booked:
+                    return BookingResult(ok=False, error="Слот только что заняли — выберите другое время.")
+
+                old_date, old_time = booking.date, booking.time
+                BookingRepo.set_slot(db, booking_id, new_date, new_time)
+                RescheduleRepo.delete_by_booking(db, booking_id)
+                BookingEventRepo.insert(
+                    db,
+                    booking_id,
+                    "rescheduled",
+                    f"{'admin' if is_admin else 'client'}:{by_user}",
+                    f"{old_date} {old_time} -> {new_date} {new_time}",
+                )
+                updated = BookingRepo.get(db, booking_id)
+            return BookingResult(ok=True, booking=updated)
+        except Exception as e:
+            logger.error("reschedule_by_client bid=%s uid=%s: %s", booking_id, by_user, e)
+            return BookingResult(ok=False, error="Не удалось перенести запись. Попробуйте ещё раз.")
+
+    def confirm_by_master(self, bid: int) -> BookingResult:
+        with get_db() as db:
+            booking = BookingRepo.get(db, bid)
+        if not booking:
+            return BookingResult(ok=False, error="Запись не найдена.")
+        if booking.status != BookingStatus.ACTIVE:
+            return BookingResult(ok=False, error="Подтверждение доступно только для активной записи.")
+        if booking.confirmed_by_master:
+            return BookingResult(ok=True, booking=booking)
+        try:
+            with atomic() as db:
+                BookingRepo.set_confirmed(db, bid, True)
+                BookingEventRepo.insert(
+                    db, bid, "confirmed_by_master", "admin",
+                    f"{booking.date} {booking.time} | {booking.service}",
+                )
+                updated = BookingRepo.get(db, bid)
+            return BookingResult(ok=True, booking=updated)
+        except Exception as e:
+            logger.error("confirm_by_master bid=%s: %s", bid, e)
+            return BookingResult(ok=False, error="Не удалось подтвердить запись.")
 
     def get_reschedule(self, booking_id: int) -> Optional[RescheduleRequest]:
         with get_db() as db:

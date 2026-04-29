@@ -9,16 +9,18 @@ from typing import Optional
 from app.core.time_utils import parse_dt
 from app.models.domain import (
     Booking, BookingStatus, Client,
-    Note, RescheduleRequest, Review,
+    Note, RescheduleRequest, Review, BookingEvent,
 )
 
 
 def _booking(r: sqlite3.Row) -> Booking:
+    has_confirmed = "confirmed_by_master" in r.keys()
     return Booking(
         id=r["id"], user_id=r["user_id"],
         service=r["service"], price=r["price"],
         date=r["date"], time=r["time"],
         status=BookingStatus(r["status"]),
+        confirmed_by_master=bool(r["confirmed_by_master"]) if has_confirmed else False,
         notified_1h=bool(r["notified_1h"]),
         notified_24h=bool(r["notified_24h"]),
         notified_return=bool(r["notified_return"]),
@@ -41,6 +43,17 @@ def _review(r: sqlite3.Row) -> Review:
         rating=r["rating"], text=r["text"],
         photo_file_id=r["photo_file_id"] or "",
         created_at=parse_dt(r["created_at_utc"]),
+    )
+
+
+def _booking_event(r: sqlite3.Row) -> BookingEvent:
+    return BookingEvent(
+        id=r["id"],
+        booking_id=r["booking_id"],
+        event_type=r["event_type"],
+        actor=r["actor"],
+        payload=r["payload"] or "",
+        created_at=parse_dt(r["created_at"]),
     )
 
 
@@ -153,6 +166,13 @@ class BookingRepo:
     @staticmethod
     def set_slot(db: sqlite3.Connection, bid: int, date: str, time: str):
         db.execute("UPDATE bookings SET date=?, time=? WHERE id=?", (date, time, bid))
+
+    @staticmethod
+    def set_confirmed(db: sqlite3.Connection, bid: int, confirmed: bool):
+        db.execute(
+            "UPDATE bookings SET confirmed_by_master=? WHERE id=?",
+            (1 if confirmed else 0, bid),
+        )
 
     @staticmethod
     def mark(db: sqlite3.Connection, bid: int, field: str):
@@ -380,6 +400,31 @@ class RescheduleRepo:
     @staticmethod
     def delete_by_booking(db: sqlite3.Connection, booking_id: int):
         db.execute("DELETE FROM reschedule_requests WHERE booking_id=?", (booking_id,))
+
+
+class BookingEventRepo:
+
+    @staticmethod
+    def insert(
+        db: sqlite3.Connection,
+        booking_id: int,
+        event_type: str,
+        actor: str,
+        payload: str = "",
+    ) -> int:
+        cur = db.execute(
+            "INSERT INTO booking_events (booking_id, event_type, actor, payload) VALUES (?,?,?,?)",
+            (booking_id, event_type, actor, payload),
+        )
+        return cur.lastrowid
+
+    @staticmethod
+    def by_booking(db: sqlite3.Connection, booking_id: int, limit: int = 50) -> list[BookingEvent]:
+        rows = db.execute(
+            "SELECT * FROM booking_events WHERE booking_id=? ORDER BY id DESC LIMIT ?",
+            (booking_id, limit),
+        ).fetchall()
+        return [_booking_event(r) for r in rows]
 
 
 

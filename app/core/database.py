@@ -145,6 +145,7 @@ _MIGRATIONS: list[tuple[int, str, list[str]]] = [
             time            TEXT    NOT NULL,
             status          TEXT    NOT NULL DEFAULT 'active'
                          CHECK(status IN ('active','cancelled','completed')),
+            confirmed_by_master INTEGER NOT NULL DEFAULT 0,
             notified_1h     INTEGER NOT NULL DEFAULT 0,
             notified_24h    INTEGER NOT NULL DEFAULT 0,
             notified_return INTEGER NOT NULL DEFAULT 0,
@@ -235,6 +236,7 @@ _MIGRATIONS: list[tuple[int, str, list[str]]] = [
             time            TEXT    NOT NULL,
             status          TEXT    NOT NULL DEFAULT 'active'
                          CHECK(status IN ('active','cancelled','completed')),
+            confirmed_by_master INTEGER NOT NULL DEFAULT 0,
             notified_1h     INTEGER NOT NULL DEFAULT 0,
             notified_24h    INTEGER NOT NULL DEFAULT 0,
             notified_return INTEGER NOT NULL DEFAULT 0,
@@ -242,7 +244,7 @@ _MIGRATIONS: list[tuple[int, str, list[str]]] = [
             created_at_utc  TEXT    NOT NULL
                          DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
         )""",
-        "INSERT INTO bookings_new SELECT * FROM bookings",
+        "INSERT INTO bookings_new SELECT id, user_id, service, price, date, time, status, 0, notified_1h, notified_24h, notified_return, review_sent, created_at_utc FROM bookings",
         "DROP TABLE bookings",
         "ALTER TABLE bookings_new RENAME TO bookings",
         # Восстанавливаем индексы из v1
@@ -339,6 +341,23 @@ _MIGRATIONS: list[tuple[int, str, list[str]]] = [
         "WHERE price > 0",
     ]),
 
+    (11, "add booking confirmation flag", [
+        "ALTER TABLE bookings ADD COLUMN confirmed_by_master INTEGER NOT NULL DEFAULT 0",
+    ]),
+
+    (12, "add booking events log", [
+        """CREATE TABLE IF NOT EXISTS booking_events (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            booking_id INTEGER NOT NULL REFERENCES bookings(id) ON DELETE CASCADE,
+            event_type TEXT    NOT NULL,
+            actor      TEXT    NOT NULL,
+            payload    TEXT    NOT NULL DEFAULT '',
+            created_at TEXT    NOT NULL
+                      DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_booking_events_booking ON booking_events(booking_id, id DESC)",
+    ]),
+
 ]
 
 
@@ -384,7 +403,16 @@ def run_migrations():
             _set_depth(1)
             try:
                 for stmt in statements:
-                    conn.execute(stmt)
+                    try:
+                        conn.execute(stmt)
+                    except sqlite3.OperationalError as e:
+                        if (
+                            version == 11
+                            and "duplicate column name" in str(e).lower()
+                            and "confirmed_by_master" in str(e).lower()
+                        ):
+                            continue
+                        raise
                 conn.execute(
                     "INSERT INTO schema_migrations (version, description) VALUES (?, ?)",
                     (version, description),

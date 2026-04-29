@@ -376,6 +376,12 @@ def build_application() -> Application:
     # ════════════════════════════════════════════════════════════════════════
     app.add_handler(CallbackQueryHandler(mh.show_master_menu,   pattern="^master_menu$"))
     app.add_handler(CallbackQueryHandler(mh.adm_today,          pattern="^adm_today$"))
+    app.add_handler(CallbackQueryHandler(mh.adm_requests,       pattern="^adm_requests$"))
+    app.add_handler(CallbackQueryHandler(mh.adm_requests_filter,pattern=r"^adm_req_filter_(today|tomorrow|week|all)$"))
+    app.add_handler(CallbackQueryHandler(mh.adm_requests_page,  pattern=r"^adm_req_page_(today|tomorrow|week|all)_\d+$"))
+    app.add_handler(CallbackQueryHandler(mh.adm_requests_page,  pattern=r"^adm_req_page_noop$"))
+    app.add_handler(CallbackQueryHandler(mh.adm_request_open,   pattern=r"^adm_req_open_\d+$"))
+    app.add_handler(CallbackQueryHandler(mh.adm_request_confirm,pattern=r"^adm_req_confirm_\d+$"))
     app.add_handler(CallbackQueryHandler(mh.adm_calendar,       pattern="^adm_calendar$"))
     app.add_handler(CallbackQueryHandler(mh.adm_calendar_week,  pattern=r"^cal_week_\d+$"))
     app.add_handler(CallbackQueryHandler(mh.adm_calendar_day,   pattern=r"^calday_\d{4}-\d{2}-\d{2}$"))

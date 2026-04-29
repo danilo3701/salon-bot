@@ -48,6 +48,7 @@ class Booking:
     date:            str
     time:            str
     status:          BookingStatus = BookingStatus.ACTIVE
+    confirmed_by_master: bool = False
     notified_1h:     bool = False
     notified_24h:    bool = False
     notified_return: bool = False
@@ -67,6 +68,16 @@ class RescheduleRequest:
     new_date:   str
     new_time:   str
     expires_at: Optional[datetime]
+
+
+@dataclass(frozen=True)
+class BookingEvent:
+    id: int
+    booking_id: int
+    event_type: str
+    actor: str
+    payload: str
+    created_at: Optional[datetime]
 
 
 @dataclass(frozen=True)

@@ -39,6 +39,12 @@ _PRICE_HELP = (
     "<code>Маникюр 25; Гель-лак 35.50; Наращивание 40</code>"
 )
 
+REQ_FILTER_TODAY = "today"
+REQ_FILTER_TOMORROW = "tomorrow"
+REQ_FILTER_WEEK = "week"
+REQ_FILTER_ALL = "all"
+REQ_PAGE_SIZE = 8
+
 
 def _parse_services_batch(raw: str) -> tuple[list[tuple[str, int]] | None, str]:
     parts = [p.strip() for p in (raw or "").split(";") if p.strip()]
@@ -198,6 +204,48 @@ async def cmd_admin(update: Update, context: CallbackContext):
     await show_master_menu(update, context)
 
 
+def _request_filter_match(booking, filter_type: str, today_iso: str) -> bool:
+    if booking.status != BookingStatus.ACTIVE:
+        return False
+    if booking.date < today_iso:
+        return False
+    d = dt_date.fromisoformat(booking.date)
+    today = dt_date.fromisoformat(today_iso)
+    if filter_type == REQ_FILTER_TODAY:
+        return d == today
+    if filter_type == REQ_FILTER_TOMORROW:
+        return d == (today + timedelta(days=1))
+    if filter_type == REQ_FILTER_WEEK:
+        start = today
+        end = today + timedelta(days=6)
+        return start <= d <= end
+    return True
+
+
+def _request_status_label(booking) -> str:
+    if booking.confirmed_by_master:
+        return "✅ Подтверждена"
+    return "🕐 Ожидает подтверждения"
+
+
+def _event_label(event_type: str) -> str:
+    return {
+        "created": "Создана",
+        "rescheduled": "Перенос",
+        "cancelled": "Отмена",
+        "confirmed_by_master": "Подтверждена мастером",
+    }.get(event_type, event_type)
+
+
+def _requests_counts(rows: list, today_iso: str) -> dict[str, int]:
+    return {
+        REQ_FILTER_TODAY: sum(1 for b in rows if _request_filter_match(b, REQ_FILTER_TODAY, today_iso)),
+        REQ_FILTER_TOMORROW: sum(1 for b in rows if _request_filter_match(b, REQ_FILTER_TOMORROW, today_iso)),
+        REQ_FILTER_WEEK: sum(1 for b in rows if _request_filter_match(b, REQ_FILTER_WEEK, today_iso)),
+        REQ_FILTER_ALL: sum(1 for b in rows if _request_filter_match(b, REQ_FILTER_ALL, today_iso)),
+    }
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 # ГЛАВНОЕ МЕНЮ МАСТЕРА
 # ════════════════════════════════════════════════════════════════════════════════
@@ -216,11 +264,30 @@ async def show_master_menu(update: Update, context: CallbackContext):
     _months = ["января","февраля","марта","апреля","мая","июня",
                  "июля","августа","сентября","октября","ноября","декабря"]
     now_str  = f"{now.day} {_months[now.month-1]}, {now.strftime('%H:%M')}"
+    bookings = svc(context, K_BOOKING).future_active()
+    today_iso = local_today().isoformat()
+    active_future = [b for b in bookings if b.status == BookingStatus.ACTIVE and b.date >= today_iso]
+    active_future.sort(key=lambda x: (x.date, x.time))
+    today_rows = [b for b in active_future if b.date == today_iso]
+    nearest = today_rows[0] if today_rows else (active_future[0] if active_future else None)
+    next_line = "⏭ <b>Ближайшая запись:</b> —"
+    if nearest:
+        client = svc(context, K_CLIENT).get(nearest.user_id)
+        cname = client.display_name if client else "Клиент"
+        cphone = client.phone if client else "—"
+        day_label = "Сегодня" if nearest.date == today_iso else fmt_date(nearest.date)
+        next_line = (
+            f"⏭ <b>Ближайшая запись:</b>\n"
+            f"{day_label}, {fmt_slot(nearest.time)} · {nearest.service}\n"
+            f"👤 {cname} · 📞 {cphone}"
+        )
+
     # Убираем ведущий ноль у числа месяца
     await edit_or_reply(
         update,
-        f"👑 <b>Панель мастера</b>\n📅 {now_str}",
+        f"👑 <b>Панель мастера</b>\n📅 {now_str}\n\n{next_line}",
         kb([
+            (f"📋 Мои записи ({len(active_future)})", "adm_requests"),
             ("📋 Сегодня",       "adm_today"),
             ("📅 Календарь",     "adm_calendar"),
             ("👥 Клиенты",       "adm_crm"),
@@ -267,6 +334,169 @@ async def adm_today(update: Update, context: CallbackContext):
     await edit_or_reply(update,
         "\n".join(lines),
         kb(buttons + [("◀️ Назад", "master_menu")]))
+
+
+async def adm_requests(update: Update, context: CallbackContext):
+    if not _is_admin(update):
+        await update.callback_query.answer("Недостаточно прав.", show_alert=True)
+        return
+    await update.callback_query.answer()
+    await _render_requests(update, context, REQ_FILTER_ALL, 1)
+
+
+async def adm_requests_filter(update: Update, context: CallbackContext):
+    if not _is_admin(update):
+        await update.callback_query.answer("Недостаточно прав.", show_alert=True)
+        return
+    await update.callback_query.answer()
+    filter_type = update.callback_query.data.replace("adm_req_filter_", "")
+    await _render_requests(update, context, filter_type, 1)
+
+
+async def adm_requests_page(update: Update, context: CallbackContext):
+    if not _is_admin(update):
+        await update.callback_query.answer("Недостаточно прав.", show_alert=True)
+        return
+    await update.callback_query.answer()
+    payload = update.callback_query.data.replace("adm_req_page_", "")
+    if payload == "noop":
+        return
+    filter_type, page_raw = payload.split("_", 1)
+    await _render_requests(update, context, filter_type, int(page_raw))
+
+
+async def _render_requests(update: Update, context: CallbackContext, filter_type: str, page: int):
+    rows = svc(context, K_BOOKING).future_active()
+    today_iso = local_today().isoformat()
+    rows = [b for b in rows if _request_filter_match(b, REQ_FILTER_ALL, today_iso)]
+    rows.sort(key=lambda x: (x.date, x.time))
+    counts = _requests_counts(rows, today_iso)
+    filtered = [b for b in rows if _request_filter_match(b, filter_type, today_iso)]
+
+    total = len(filtered)
+    total_pages = max(1, (total + REQ_PAGE_SIZE - 1) // REQ_PAGE_SIZE)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * REQ_PAGE_SIZE
+    page_items = filtered[start:start + REQ_PAGE_SIZE]
+
+    lines = ["💼 <b>Мои записи</b>", ""]
+    if not page_items:
+        lines.append("По выбранному фильтру записей нет.")
+    else:
+        for b in page_items:
+            lines.append(
+                f"#{b.id} · {_request_status_label(b)} · "
+                f"{'Сегодня' if b.date == today_iso else fmt_date(b.date)} {fmt_slot(b.time)}"
+            )
+    text = "\n".join(lines)
+
+    def _active(ft: str, label: str) -> str:
+        return f"✅ {label}" if filter_type == ft else label
+
+    grid = []
+    for b in page_items:
+        grid.append((f"#{b.id}", f"adm_req_open_{b.id}"))
+
+    nav = []
+    if page > 1:
+        nav.append(("◀️", f"adm_req_page_{filter_type}_{page - 1}"))
+    nav.append((f"·{page}/{total_pages}·", "adm_req_page_noop"))
+    if page < total_pages:
+        nav.append(("▶️", f"adm_req_page_{filter_type}_{page + 1}"))
+
+    buttons = [
+        (_active(REQ_FILTER_TODAY, f"📆 Сегодня ({counts[REQ_FILTER_TODAY]})"), "adm_req_filter_today"),
+        (_active(REQ_FILTER_TOMORROW, f"📆 Завтра ({counts[REQ_FILTER_TOMORROW]})"), "adm_req_filter_tomorrow"),
+        (_active(REQ_FILTER_WEEK, f"📆 Эта неделя ({counts[REQ_FILTER_WEEK]})"), "adm_req_filter_week"),
+        (_active(REQ_FILTER_ALL, "📁 Все"), "adm_req_filter_all"),
+    ]
+    buttons.extend(grid)
+    buttons.extend(nav)
+    buttons.append(("← Назад", "master_menu"))
+
+    await edit_or_reply(update, text, kb(buttons, cols=2))
+
+
+async def adm_request_open(update: Update, context: CallbackContext):
+    if not _is_admin(update):
+        await update.callback_query.answer("Недостаточно прав.", show_alert=True)
+        return
+    await update.callback_query.answer()
+    bid = int(update.callback_query.data.replace("adm_req_open_", ""))
+    b = svc(context, K_BOOKING).get(bid)
+    if not b:
+        await edit_or_reply(update, "Запись не найдена.", kb([("← К списку", "adm_requests")]))
+        return
+    client = svc(context, K_CLIENT).get(b.user_id)
+    name = client.display_name if client else "Клиент"
+    phone = client.phone if client else "—"
+
+    card = svc(context, K_CLIENT).card(b.user_id)
+    last_visits = []
+    if card:
+        today = local_today().isoformat()
+        past = [
+            x for x in card.bookings
+            if x.status in (BookingStatus.ACTIVE, BookingStatus.COMPLETED) and x.date < today
+        ]
+        past.sort(key=lambda x: (x.date, x.time), reverse=True)
+        last_visits = past[:3]
+
+    lines = [
+        f"📥 <b>Запись #{b.id}</b>",
+        f"🗓 {fmt_date(b.date)}, {fmt_slot(b.time)}",
+        f"💅 {b.service}",
+        f"👤 {name}",
+        f"📞 {phone}",
+        f"Статус: {_request_status_label(b)}",
+    ]
+    if last_visits:
+        lines.append("")
+        lines.append("<b>Последние визиты:</b>")
+        for v in last_visits:
+            lines.append(f"• {fmt_date(v.date)} — {v.service}")
+
+    events = svc(context, K_BOOKING).events(b.id, limit=6)
+    if events:
+        lines.append("")
+        lines.append("<b>Журнал:</b>")
+        for ev in reversed(events):
+            dt = ev.created_at.strftime("%d.%m %H:%M") if ev.created_at else "—"
+            payload = f" · {ev.payload}" if ev.payload else ""
+            lines.append(f"• {dt} — {_event_label(ev.event_type)}{payload}")
+
+    await edit_or_reply(
+        update,
+        "\n".join(lines),
+        kb([
+            ("✅ Подтвердить", f"adm_req_confirm_{b.id}"),
+            ("🔄 Перенести", f"reschedule_{b.id}"),
+            ("👤 Карточка клиента", f"crm_{b.user_id}"),
+            ("← К списку", "adm_requests"),
+            ("🏠 Меню", "master_menu"),
+        ], cols=2),
+    )
+
+
+async def adm_request_confirm(update: Update, context: CallbackContext):
+    if not _is_admin(update):
+        await update.callback_query.answer("Недостаточно прав.", show_alert=True)
+        return
+    await update.callback_query.answer()
+    bid = int(update.callback_query.data.replace("adm_req_confirm_", ""))
+    result = svc(context, K_BOOKING).confirm_by_master(bid)
+    if not result.ok:
+        await edit_or_reply(update, f"⚠️ {result.error}", kb([("← К списку", "adm_requests")]))
+        return
+    b = result.booking
+    await safe_send(
+        context.bot,
+        b.user_id,
+        f"✅ Мастер подтвердил вашу запись.\n\n{fmt_booking(b)}{_SIGN}",
+        kb([("📋 Мои записи", "my_bookings")]),
+    )
+    update.callback_query.data = f"adm_req_open_{bid}"
+    await adm_request_open(update, context)
 
 
 async def _show_day(update, context, date_str: str,

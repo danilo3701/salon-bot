@@ -372,10 +372,18 @@ async def cb_book_confirm(update: Update, context: CallbackContext):
         f"Если нужно перенести или отменить — откройте «📋 Мои записи».{_SIGN}",
         kb([("📋 Мои записи", "my_bookings")] + back_main()))
 
-    await notify_admins(context.bot,
-        f"📩 <b>Новая запись!</b>\n\n"
+    await notify_admins(
+        context.bot,
+        f"📩 <b>Новая запись #{b.id}</b>\n\n"
         f"👤 {name}  📞 {phone}\n"
-        f"{fmt_booking(b)}")
+        f"{fmt_booking(b)}",
+        kb([
+            ("✅ Подтвердить", f"adm_req_confirm_{b.id}"),
+            ("🔄 Перенести", f"reschedule_{b.id}"),
+            ("👤 Карточка клиента", f"crm_{uid}"),
+            ("📋 Мои записи", "adm_requests"),
+        ], cols=2),
+    )
 
     for k in ("book_service", "book_date", "book_time", "book_price"):
         context.user_data.pop(k, None)
@@ -593,29 +601,42 @@ async def cb_reschedule_yes(update: Update, context: CallbackContext):
     bid      = int(parts[1])
     date_str = parts[2]
     time_str = parts[3]
-    b        = svc(context, K_BOOKING).get(bid)
-    if not b:
+    b_before = svc(context, K_BOOKING).get(bid)
+    if not b_before:
         await edit_or_reply(update, "Запись не найдена.", kb(back_main()))
         return
-    svc(context, K_BOOKING).request_reschedule(bid, date_str, time_str)
-    await edit_or_reply(update,
-        f"✅ Запрос на перенос отправлен мастеру.\n\n"
-        f"Ожидайте подтверждения.{_SIGN}",
-        kb(back_main()))
 
-    uid, _  = uid_uname(update)
-    client  = svc(context, K_CLIENT).get(uid)
-    name    = client.display_name if client else "Клиент"
-    await notify_admins(context.bot,
-        f"🔄 <b>Запрос на перенос</b>\n\n"
-        f"👤 {name}\n"
-        f"Было: {fmt_date(b.date)} {fmt_slot(b.time)}\n"
-        f"Хочет: {fmt_date(date_str)} {fmt_slot(time_str)}",
-        kb([
-            ("✅ Подтвердить", f"adm_rconfirm_{bid}"),
-            ("❌ Отклонить",   f"adm_rdecline_{bid}"),
-        ]))
+    uid, _ = uid_uname(update)
+    result = svc(context, K_BOOKING).reschedule_by_client(bid, uid, date_str, time_str)
+    if not result.ok:
+        await edit_or_reply(
+            update,
+            f"⚠️ {result.error}",
+            kb([("◀️ Выбрать другое время", f"rdate_{date_str}"), ("📋 Мои записи", "my_bookings")]),
+        )
+        return
 
+    b_after = result.booking
+    await edit_or_reply(
+        update,
+        f"✅ <b>Запись перенесена!</b>\n\n"
+        f"{fmt_booking(b_after)}\n\n"
+        f"{_SIGN}",
+        kb([("📋 Мои записи", "my_bookings")] + back_main()),
+    )
+
+    actor_is_admin = uid in settings.ADMIN_IDS
+    actor_client = svc(context, K_CLIENT).get(b_before.user_id)
+    actor_name = actor_client.display_name if actor_client else "Клиент"
+    action_label = "Мастер перенёс запись" if actor_is_admin else "Клиент перенёс запись"
+    await notify_admins(
+        context.bot,
+        f"🔄 <b>{action_label}</b>\n\n"
+        f"👤 {actor_name}\n"
+        f"Было: {fmt_date(b_before.date)} {fmt_slot(b_before.time)}\n"
+        f"Стало: {fmt_date(b_after.date)} {fmt_slot(b_after.time)}\n"
+        f"💅 {b_after.service}",
+    )
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ОТЗЫВ
