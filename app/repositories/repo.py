@@ -669,6 +669,27 @@ class WeeklyScheduleRepo:
             (weekday,),
         )
 
+    @staticmethod
+    def replace_day_times(db: sqlite3.Connection, source_weekday: int, target_weekday: int) -> int:
+        WeeklyScheduleRepo.ensure_day(db, source_weekday)
+        WeeklyScheduleRepo.ensure_day(db, target_weekday)
+        src_rows = db.execute(
+            "SELECT hhmm, sort_order FROM weekly_day_times WHERE weekday=? ORDER BY sort_order, hhmm",
+            (source_weekday,),
+        ).fetchall()
+        db.execute("DELETE FROM weekly_day_times WHERE weekday=?", (target_weekday,))
+        for row in src_rows:
+            db.execute(
+                "INSERT INTO weekly_day_times (weekday, hhmm, sort_order) VALUES (?,?,?)",
+                (target_weekday, row["hhmm"], row["sort_order"]),
+            )
+        db.execute(
+            "UPDATE weekly_day_templates "
+            "SET updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE weekday=?",
+            (target_weekday,),
+        )
+        return len(src_rows)
+
 
 class BlockedSlotRepo:
 

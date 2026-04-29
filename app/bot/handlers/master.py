@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import re
+import types
 from datetime import date as dt_date, timedelta
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -21,12 +22,39 @@ from app.bot.helpers import (
     plural, safe_reply, safe_send, stars, svc, uid_uname,
 )
 from app.core.settings import settings
+from app.core.money import format_eur, parse_eur_input_to_cents
 from app.core.time_utils import fmt_date, fmt_slot, local_today
 from app.models.domain import BookingStatus
 
 logger = logging.getLogger("salon.master")
 
 _SIGN = f"\n\n— {settings.MASTER_USERNAME}"
+
+_PRICE_HELP = (
+    "ℹ️ <b>Как вводить цену в EUR</b>\n"
+    "• Целое число: <code>25</code>\n"
+    "• С центами через точку: <code>25.50</code>\n"
+    "• С центами через запятую: <code>25,50</code>\n\n"
+    "Можно добавить сразу несколько услуг одной строкой:\n"
+    "<code>Маникюр 25; Гель-лак 35.50; Наращивание 40</code>"
+)
+
+
+def _parse_services_batch(raw: str) -> tuple[list[tuple[str, int]] | None, str]:
+    parts = [p.strip() for p in (raw or "").split(";") if p.strip()]
+    if not parts:
+        return None, "Введите услугу в формате: Название 25 или несколько через `;`."
+    out: list[tuple[str, int]] = []
+    for i, part in enumerate(parts, start=1):
+        m = re.match(r"^(.+?)\s+(\d+(?:[.,]\d{1,2})?)$", part)
+        if not m:
+            return None, f"Позиция {i}: используйте формат `Название 25.50`."
+        name = m.group(1).strip()
+        cents = parse_eur_input_to_cents(m.group(2))
+        if not name or len(name) > 80 or cents is None:
+            return None, f"Позиция {i}: проверьте название и цену."
+        out.append((name, cents))
+    return out, ""
 
 
 def register_steps(dispatcher):
@@ -109,6 +137,14 @@ def _cb_ads_dayok(weekday: int, is_open: bool, ok: bool) -> str:
 
 def _cb_ads_per(weekday: int, is_closed: bool) -> str:
     return f"ads:per:{weekday}:{1 if is_closed else 0}"
+
+
+def _cb_ads_copy(weekday: int) -> str:
+    return f"ads:copy:{weekday}"
+
+
+def _cb_ads_copyto(source_weekday: int, target_weekday: int) -> str:
+    return f"ads:copyto:{source_weekday}:{target_weekday}"
 
 
 def _from_hhmm_token(token: str) -> str | None:
@@ -507,7 +543,7 @@ async def cb_crm_client(update: Update, context: CallbackContext):
         f"👤 <b>{c.display_name}</b>\n"
         f"📞 {c.phone}  |  {c.username or '—'}\n\n"
         f"Визитов: <b>{card.visits}</b>  ·  "
-        f"Потрачено: <b>{card.total_spent:,} руб.</b>\n"
+        f"Потрачено: <b>{format_eur(card.total_spent)}</b>\n"
         f"Предстоящих: <b>{card.upcoming}</b>  ·  "
         f"Отмен: {len(cancelled)}\n"
         f"Последний визит: {fmt_date(card.last_visit) if card.last_visit else '—'}\n"
@@ -519,7 +555,7 @@ async def cb_crm_client(update: Update, context: CallbackContext):
     if past:
         text += "\n<b>📋 Последние визиты:</b>\n"
         for b in sorted(past, key=lambda x: x.date, reverse=True)[:5]:
-            text += f"  {fmt_date(b.date)} — {b.service} ({b.price:,} руб.)\n"
+            text += f"  {fmt_date(b.date)} — {b.service} ({format_eur(b.price)})\n"
     if card.notes:
         text += "\n<b>📝 Заметки:</b>\n"
         for n in card.notes[:3]:
@@ -608,14 +644,14 @@ async def adm_stats(update: Update, context: CallbackContext):
             "",
             f"👥 Клиентов: <b>{s.unique_clients}</b>",
             f"📋 Визитов всего: <b>{s.total_bookings}</b>",
-            f"💰 Выручка: <b>{s.total_revenue:,} руб.</b>",
-            (f"💵 Средний чек: <b>{s.total_revenue // s.total_bookings:,} руб.</b>"
+            f"💰 Выручка: <b>{format_eur(s.total_revenue)}</b>",
+            (f"💵 Средний чек: <b>{format_eur(s.total_revenue // s.total_bookings)}</b>"
              if s.total_bookings else None),
             f"❌ Отмен: {s.cancelled}",
             "",
             f"📅 <b>{s.month_label}:</b>",
             f"   Записей: {s.month_bookings}",
-            f"   Выручка: {s.month_revenue:,} руб.",
+            f"   Выручка: {format_eur(s.month_revenue)}",
             "",
             f"⭐ Средняя оценка: {avg}",
         ])),
@@ -627,7 +663,8 @@ async def adm_stats(update: Update, context: CallbackContext):
 # ════════════════════════════════════════════════════════════════════════════════
 
 async def adm_services(update: Update, context: CallbackContext):
-    await update.callback_query.answer()
+    if update.callback_query:
+        await update.callback_query.answer()
     services = svc(context, K_SERVICE).all()
     if not services:
         await edit_or_reply(update,
@@ -636,7 +673,7 @@ async def adm_services(update: Update, context: CallbackContext):
         return
     lines = ["💅 <b>Услуги</b>\n"]
     for name, price in services.items():
-        lines.append(f"• {name} — <b>{price:,} руб.</b>")
+        lines.append(f"• {name} — <b>{format_eur(price)}</b>")
     text    = "\n".join(lines)
     buttons = [(f"✏️ {name}", f"adm_srv_edit_{name}") for name in services]
     buttons.append(("➕ Добавить услугу", "adm_srv_add"))
@@ -652,9 +689,10 @@ async def adm_srv_edit(update: Update, context: CallbackContext):
         await edit_or_reply(update, "Услуга не найдена.", kb(back_master()))
         return
     await edit_or_reply(update,
-        f"✏️ <b>{name}</b> — {price:,} руб.\n\nЧто изменить?",
+        f"✏️ <b>{name}</b> — {format_eur(price)}\n\nЧто изменить?",
         kb([
             ("💰 Изменить цену", f"adm_srv_price_{name}"),
+            ("ℹ️ Пример ввода", "adm_srv_help"),
             ("🔤 Переименовать", f"adm_srv_rename_{name}"),
             ("🗑 Удалить",       f"adm_srv_delete_{name}"),
             ("◀️ К услугам",     "adm_services"),
@@ -665,23 +703,42 @@ async def adm_srv_add(update: Update, context: CallbackContext):
     await update.callback_query.answer()
     set_step(context.user_data, "srv_add_name")
     await edit_or_reply(update,
-        "➕ <b>Новая услуга</b>\n\nВведите название услуги:",
-        kb([("◀️ Отмена", "adm_services")]))
+        "➕ <b>Новая услуга</b>\n\n"
+        "Введите услугу в формате <code>Название 25</code>\n"
+        "или несколько услуг через <code>;</code>.\n\n"
+        f"{_PRICE_HELP}",
+        kb([("ℹ️ Пример ввода", "adm_srv_help"), ("◀️ Отмена", "adm_services")]))
 
 
 async def _step_srv_add_name(update: Update, context: CallbackContext):
-    name = update.message.text.strip()
-    if not name:
-        await update.message.reply_text("⚠️ Название не может быть пустым.")
+    raw = update.message.text.strip()
+    items, err = _parse_services_batch(raw)
+    if items is None:
+        name = raw
+        if not name or len(name) > 80:
+            await update.message.reply_text("⚠️ Название должно быть от 1 до 80 символов.")
+            return
+        set_step(context.user_data, "srv_add_price")
+        context.user_data["srv_new_name"] = name
+        await update.message.reply_text(
+            f"Услуга: <b>{name}</b>\n\nВведите цену в EUR.\n\n{_PRICE_HELP}",
+            parse_mode="HTML",
+        )
         return
-    if len(name) > 80:
-        await update.message.reply_text("⚠️ Название слишком длинное (макс. 80 символов).")
-        return
-    set_step(context.user_data, "srv_add_price")
-    context.user_data["srv_new_name"] = name
+    added: list[str] = []
+    for name, cents in items:
+        ok, msg = svc(context, K_SERVICE).add(name, cents)
+        if not ok:
+            await update.message.reply_text(f"⚠️ {msg}")
+            return
+        added.append(f"• {name} — <b>{format_eur(cents)}</b>")
+    set_step(context.user_data, None)
     await update.message.reply_text(
-        f"Услуга: <b>{name}</b>\n\nВведите цену (только цифры, руб.):",
-        parse_mode="HTML")
+        "✅ Услуги добавлены:\n" + "\n".join(added),
+        parse_mode="HTML",
+    )
+    fake_update = types.SimpleNamespace(callback_query=None, message=update.message)
+    await adm_services(fake_update, context)
 
 
 async def _step_srv_add_price(update: Update, context: CallbackContext):
@@ -690,31 +747,35 @@ async def _step_srv_add_price(update: Update, context: CallbackContext):
     if not name:
         return
     raw = update.message.text.strip()
-    if not raw.isdigit():
-        await update.message.reply_text("⚠️ Цена должна быть числом.")
+    price = parse_eur_input_to_cents(raw)
+    if price is None:
+        await update.message.reply_text("⚠️ Неверный формат цены. Пример: 25, 25.50 или 25,50.")
         return
-    price  = int(raw)
     ok, err = svc(context, K_SERVICE).add(name, price)
     if ok:
         await update.message.reply_text(
-            f"✅ Услуга <b>{name}</b> — {price:,} руб. добавлена.",
-            reply_markup=kb([("◀️ К услугам", "adm_services")] + back_master()),
+            f"✅ Услуга <b>{name}</b> — {format_eur(price)} добавлена.",
             parse_mode="HTML")
+        fake_update = types.SimpleNamespace(callback_query=None, message=update.message)
+        await adm_services(fake_update, context)
     else:
-        await update.message.reply_text(f"⚠️ {err}",
-            reply_markup=kb([("◀️ К услугам", "adm_services")] + back_master()))
+        await update.message.reply_text(f"⚠️ {err}")
 
 
 async def adm_srv_price(update: Update, context: CallbackContext):
     await update.callback_query.answer()
     name     = update.callback_query.data.replace("adm_srv_price_", "", 1)
     services = svc(context, K_SERVICE).all()
-    current  = services.get(name, "—")
+    current  = services.get(name)
+    if current is None:
+        await edit_or_reply(update, "Услуга не найдена.", kb(back_master()))
+        return
     set_step(context.user_data, "srv_edit_price")
     context.user_data["srv_edit_name"] = name
     await edit_or_reply(update,
-        f"💰 <b>{name}</b>\nТекущая цена: {current:,} руб.\n\nВведите новую цену:",
-        kb([("◀️ Отмена", f"adm_srv_edit_{name}")]))
+        f"💰 <b>{name}</b>\nТекущая цена: {format_eur(current)}\n\n"
+        f"Введите новую цену в EUR.\n\n{_PRICE_HELP}",
+        kb([("ℹ️ Пример ввода", "adm_srv_help"), ("◀️ Отмена", f"adm_srv_edit_{name}")]))
 
 
 async def _step_srv_edit_price(update: Update, context: CallbackContext):
@@ -723,18 +784,28 @@ async def _step_srv_edit_price(update: Update, context: CallbackContext):
     if not name:
         return
     raw = update.message.text.strip()
-    if not raw.isdigit():
-        await update.message.reply_text("⚠️ Введите целое число.")
+    price = parse_eur_input_to_cents(raw)
+    if price is None:
+        await update.message.reply_text("⚠️ Неверный формат цены. Пример: 25, 25.50 или 25,50.")
         return
-    price  = int(raw)
     ok, err = svc(context, K_SERVICE).update_price(name, price)
     if ok:
         await update.message.reply_text(
-            f"✅ Цена <b>{name}</b> обновлена: {price:,} руб.",
-            reply_markup=kb([("◀️ К услугам", "adm_services")] + back_master()),
+            f"✅ Цена <b>{name}</b> обновлена: {format_eur(price)}.",
             parse_mode="HTML")
+        fake_update = types.SimpleNamespace(callback_query=None, message=update.message)
+        await adm_services(fake_update, context)
     else:
         await update.message.reply_text(f"⚠️ {err}")
+
+
+async def adm_srv_help(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    await edit_or_reply(
+        update,
+        f"{_PRICE_HELP}",
+        kb([("◀️ К услугам", "adm_services")]),
+    )
 
 
 async def adm_srv_rename(update: Update, context: CallbackContext):
@@ -990,7 +1061,10 @@ def _ads_day_markup(weekday: int, day: dict) -> InlineKeyboardMarkup:
         ))
     for i in range(0, len(chips), 4):
         rows.append(chips[i:i + 4])
-    rows.append([InlineKeyboardButton("➕ Добавить время", callback_data=_cb_ads_add(weekday))])
+    rows.append([
+        InlineKeyboardButton("➕ Добавить время", callback_data=_cb_ads_add(weekday)),
+        InlineKeyboardButton("📋 Скопировать шаблон", callback_data=_cb_ads_copy(weekday)),
+    ])
 
     day_target = not day["is_open"]
     day_label = "🔓 Открыть день" if day_target else "🔒 Закрыть день"
@@ -1008,8 +1082,7 @@ def _ads_day_markup(weekday: int, day: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-async def _ads_render_day(update: Update, context: CallbackContext, weekday: int, note: str = ""):
-    day = _wsvc(context).get_day_template(weekday)
+def _ads_day_text(weekday: int, day: dict, note: str = "") -> str:
     groups = _ads_group_times(day["times"])
     lines = [
         f"📅 <b>{_WD_FULL.get(weekday, str(weekday))}</b> (шаблон)",
@@ -1034,7 +1107,25 @@ async def _ads_render_day(update: Update, context: CallbackContext, weekday: int
     if note:
         lines.append("")
         lines.append(note)
-    await edit_or_reply(update, "\n".join(lines), _ads_day_markup(weekday, day))
+    return "\n".join(lines)
+
+
+async def _ads_render_day(update: Update, context: CallbackContext, weekday: int, note: str = ""):
+    day = _wsvc(context).get_day_template(weekday)
+    await edit_or_reply(update, _ads_day_text(weekday, day, note), _ads_day_markup(weekday, day))
+
+
+async def _ads_render_day_by_message(
+    context: CallbackContext, chat_id: int, message_id: int, weekday: int, note: str = ""
+):
+    day = _wsvc(context).get_day_template(weekday)
+    await context.bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=message_id,
+        text=_ads_day_text(weekday, day, note),
+        reply_markup=_ads_day_markup(weekday, day),
+        parse_mode="HTML",
+    )
 
 
 async def _ads_redirect_notice(update: Update, context: CallbackContext, note: str):
@@ -1078,6 +1169,9 @@ async def ads_add(update: Update, context: CallbackContext):
         return
     weekday = int(parts[2])
     context.user_data["ads_weekday"] = weekday
+    if update.callback_query and update.callback_query.message:
+        context.user_data["ads_origin_chat_id"] = update.callback_query.message.chat_id
+        context.user_data["ads_origin_msg_id"] = update.callback_query.message.message_id
     set_step(context.user_data, "ads_add_time_input")
     await edit_or_reply(
         update,
@@ -1089,19 +1183,29 @@ async def ads_add(update: Update, context: CallbackContext):
 async def _step_ads_add_time_input(update: Update, context: CallbackContext):
     weekday = int(context.user_data.get("ads_weekday") or 0)
     hhmm = _normalize_hhmm(update.message.text or "")
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
     if weekday < 1 or weekday > 7:
         set_step(context.user_data, None)
-        await update.message.reply_text("Сессия истекла.", reply_markup=kb([("🏠 Меню", "master_menu")]))
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="Сессия истекла.")
         return
     if not hhmm:
-        await update.message.reply_text("⚠️ Формат времени: ЧЧ:ММ.")
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="⚠️ Формат времени: ЧЧ:ММ.")
         return
     ok, msg = _wsvc(context).add_weekly_time(weekday, hhmm)
     set_step(context.user_data, None)
-    if not ok:
-        await update.message.reply_text(f"⚠️ {msg}", reply_markup=kb([("◀️ К дню", _cb_ads_wd(weekday))]))
-        return
-    await update.message.reply_text(f"✅ Добавлено: {msg}", reply_markup=kb([("◀️ К дню", _cb_ads_wd(weekday))]))
+    note = f"✅ Добавлено: {msg}" if ok else f"⚠️ {msg}"
+    chat_id = context.user_data.get("ads_origin_chat_id")
+    message_id = context.user_data.get("ads_origin_msg_id")
+    if chat_id and message_id:
+        try:
+            await _ads_render_day_by_message(context, int(chat_id), int(message_id), weekday, note)
+            return
+        except Exception:
+            pass
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=note)
 
 
 async def ads_rm(update: Update, context: CallbackContext):
@@ -1192,6 +1296,9 @@ async def ads_per(update: Update, context: CallbackContext):
         await _ads_render_day(update, context, weekday, "✅ Период открыт")
         return
     context.user_data["ads_weekday"] = weekday
+    if update.callback_query and update.callback_query.message:
+        context.user_data["ads_origin_chat_id"] = update.callback_query.message.chat_id
+        context.user_data["ads_origin_msg_id"] = update.callback_query.message.message_id
     set_step(context.user_data, "ads_add_period_input")
     await edit_or_reply(
         update,
@@ -1200,22 +1307,91 @@ async def ads_per(update: Update, context: CallbackContext):
     )
 
 
+async def ads_copy(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    parts = update.callback_query.data.split(":")
+    if len(parts) != 3:
+        await update.callback_query.answer("Некорректный callback", show_alert=True)
+        return
+    try:
+        source_weekday = int(parts[2])
+    except ValueError:
+        await update.callback_query.answer("Некорректный день", show_alert=True)
+        return
+    if source_weekday < 1 or source_weekday > 7:
+        await update.callback_query.answer("День 1..7", show_alert=True)
+        return
+    target_buttons = []
+    for wd in range(1, 8):
+        if wd == source_weekday:
+            continue
+        target_buttons.append(
+            InlineKeyboardButton(_WD_SHORT.get(wd, str(wd)), callback_data=_cb_ads_copyto(source_weekday, wd))
+        )
+    rows = [target_buttons[i:i + 3] for i in range(0, len(target_buttons), 3)]
+    rows.append([
+        InlineKeyboardButton("◀️ Назад", callback_data=_cb_ads_wd(source_weekday)),
+        InlineKeyboardButton("🏠 Меню", callback_data="master_menu"),
+    ])
+    await edit_or_reply(
+        update,
+        f"📋 <b>Копировать шаблон: {_WD_FULL.get(source_weekday, str(source_weekday))}</b>\n\n"
+        "Выберите день, в который скопировать расписание.\n"
+        "⚠️ Все существующие слоты в целевом дне будут заменены.",
+        InlineKeyboardMarkup(rows),
+    )
+
+
+async def ads_copyto(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    parts = update.callback_query.data.split(":")
+    if len(parts) != 4:
+        await update.callback_query.answer("Некорректный callback", show_alert=True)
+        return
+    try:
+        source_weekday = int(parts[2])
+        target_weekday = int(parts[3])
+    except ValueError:
+        await update.callback_query.answer("Некорректный день", show_alert=True)
+        return
+    ok, result = _wsvc(context).copy_day_template(source_weekday, target_weekday)
+    if not ok:
+        await _ads_render_day(update, context, source_weekday, f"⚠️ {result}")
+        return
+    await _ads_render_day(
+        update,
+        context,
+        source_weekday,
+        f"✅ Скопировано в {_WD_SHORT.get(target_weekday, str(target_weekday))}: {result} сл.",
+    )
+
+
 async def _step_ads_add_period_input(update: Update, context: CallbackContext):
     weekday = int(context.user_data.get("ads_weekday") or 0)
     parsed = _normalize_period(update.message.text or "")
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
     if weekday < 1 or weekday > 7:
         set_step(context.user_data, None)
-        await update.message.reply_text("Сессия истекла.", reply_markup=kb([("🏠 Меню", "master_menu")]))
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="Сессия истекла.")
         return
     if not parsed:
-        await update.message.reply_text("⚠️ Формат периода: ЧЧ:ММ-ЧЧ:ММ.")
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="⚠️ Формат периода: ЧЧ:ММ-ЧЧ:ММ.")
         return
     ok, msg = _wsvc(context).set_closed_period(weekday, parsed[0], parsed[1])
     set_step(context.user_data, None)
-    if not ok:
-        await update.message.reply_text(f"⚠️ {msg}", reply_markup=kb([("◀️ К дню", _cb_ads_wd(weekday))]))
-        return
-    await update.message.reply_text(f"✅ Период установлен: {msg}", reply_markup=kb([("◀️ К дню", _cb_ads_wd(weekday))]))
+    note = f"✅ Период установлен: {msg}" if ok else f"⚠️ {msg}"
+    chat_id = context.user_data.get("ads_origin_chat_id")
+    message_id = context.user_data.get("ads_origin_msg_id")
+    if chat_id and message_id:
+        try:
+            await _ads_render_day_by_message(context, int(chat_id), int(message_id), weekday, note)
+            return
+        except Exception:
+            pass
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=note)
 
 
 async def adm_schedule(update: Update, context: CallbackContext):

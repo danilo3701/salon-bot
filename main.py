@@ -405,6 +405,7 @@ def build_application() -> Application:
     # ════════════════════════════════════════════════════════════════════════
     app.add_handler(CallbackQueryHandler(mh.adm_services,       pattern="^adm_services$"))
     app.add_handler(CallbackQueryHandler(mh.adm_srv_add,        pattern="^adm_srv_add$"))
+    app.add_handler(CallbackQueryHandler(mh.adm_srv_help,       pattern="^adm_srv_help$"))
     app.add_handler(CallbackQueryHandler(mh.adm_srv_edit,       pattern=r"^adm_srv_edit_.+$"))
     app.add_handler(CallbackQueryHandler(mh.adm_srv_price,      pattern=r"^adm_srv_price_.+$"))
     app.add_handler(CallbackQueryHandler(mh.adm_srv_rename,     pattern=r"^adm_srv_rename_.+$"))
@@ -424,6 +425,8 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(mh.ads_day,              pattern=r"^ads:day:[1-7]:[01]$"))
     app.add_handler(CallbackQueryHandler(mh.ads_dayok,            pattern=r"^ads:dayok:[1-7]:[01]:[01]$"))
     app.add_handler(CallbackQueryHandler(mh.ads_per,              pattern=r"^ads:per:[1-7]:[01]$"))
+    app.add_handler(CallbackQueryHandler(mh.ads_copy,             pattern=r"^ads:copy:[1-7]$"))
+    app.add_handler(CallbackQueryHandler(mh.ads_copyto,           pattern=r"^ads:copyto:[1-7]:[1-7]$"))
     # Новые callback
     app.add_handler(CallbackQueryHandler(mh.adm_sched_add,        pattern="^adm_sched_add$"))
     app.add_handler(CallbackQueryHandler(mh.adm_sched_toggle,     pattern=r"^adm_sched_toggle_(on|off)_\d{2}:\d{2}$"))

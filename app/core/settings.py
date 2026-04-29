@@ -84,6 +84,7 @@ class Settings:
         self.RATE_RESCHEDULE:  tuple[int, int] = _rate(_get("RATE_RESCHEDULE",  "3/300"))
 
         self.TIMEZONE: str = _get("TIMEZONE", "Europe/Moscow")
+        self.RUB_TO_EUR_RATE: float = float(_get("RUB_TO_EUR_RATE", "100"))
 
     @property
     def DB_PATH(self) -> str:

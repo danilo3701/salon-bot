@@ -168,6 +168,15 @@ class WeeklyScheduleService:
             WeeklyScheduleRepo.clear_closed_period(db, weekday)
         return True, "ok"
 
+    def copy_day_template(self, source_weekday: int, target_weekday: int) -> tuple[bool, int | str]:
+        if source_weekday < 1 or source_weekday > 7 or target_weekday < 1 or target_weekday > 7:
+            return False, "ÐÐµÐºÐ¾Ñ€Ñ€ÐµÐºÑ‚Ð½Ñ‹Ð¹ Ð´ÐµÐ½ÑŒ Ð½ÐµÐ´ÐµÐ»Ð¸."
+        if source_weekday == target_weekday:
+            return False, "ÐÐµÐ»ÑŒÐ·Ñ ÐºÐ¾Ð¿Ð¸Ñ€Ð¾Ð²Ð°Ñ‚ÑŒ ÑˆÐ°Ð±Ð»Ð¾Ð½ Ð² Ñ‚Ð¾Ñ‚ Ð¶Ðµ Ð´ÐµÐ½ÑŒ."
+        with atomic() as db:
+            copied = WeeklyScheduleRepo.replace_day_times(db, source_weekday, target_weekday)
+        return True, copied
+
     def times_for_date(self, date_str: str, db=None) -> list[str]:
         def _compute(conn) -> list[str]:
             weekday = _weekday_from_date(date_str)

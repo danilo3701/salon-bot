@@ -21,6 +21,7 @@ from app.bot.helpers import (
     safe_reply, safe_send, stars, svc, uid_uname, validate_phone,
 )
 from app.core.settings import settings
+from app.core.money import format_eur
 from app.core.time_utils import fmt_date, fmt_slot
 from app.models.domain import BookingStatus
 
@@ -100,7 +101,7 @@ async def show_prices(update: Update, context: CallbackContext):
     set_step(context.user_data, None)  # сброс любого незавершённого ввода
     services = svc(context, K_SERVICE).all()
     lines = "\n".join(
-        f"• {name}: <b>{price:,} руб.</b>"
+        f"• {name}: <b>{format_eur(price)}</b>"
         for name, price in services.items()
     )
     await edit_or_reply(update,
@@ -219,7 +220,7 @@ async def _show_date_week(update, context, service: str, price: int,
     else:
         note = nl2 + "<i>Тапните на число, чтобы выбрать день</i>"
     text = (
-        "💅 <b>" + service + "</b> — " + f"{price:,}" + " руб."
+        "💅 <b>" + service + "</b> — " + format_eur(price)
         + chr(10) + chr(10) + week_header + note
     )
     await edit_or_reply(update, text, markup)
@@ -281,7 +282,7 @@ async def _show_confirm(update, context, name: str):
     await edit_or_reply(update,
         f"📋 <b>Подтверждение записи</b>\n\n"
         f"👤 {name}\n"
-        f"💅 {service} — {price:,} руб.\n"
+        f"💅 {service} — {format_eur(price)}\n"
         f"📅 {fmt_date(date_str)}\n"
         f"⏰ {fmt_slot(time_str)}\n\n"
         f"Всё верно?",

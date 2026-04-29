@@ -332,6 +332,13 @@ _MIGRATIONS: list[tuple[int, str, list[str]]] = [
         )""",
     ]),
 
+    (10, "convert rub prices to eur cents", [
+        f"UPDATE services SET price = CAST(ROUND((price / {settings.RUB_TO_EUR_RATE}) * 100.0) AS INTEGER) "
+        "WHERE price > 0",
+        f"UPDATE bookings SET price = CAST(ROUND((price / {settings.RUB_TO_EUR_RATE}) * 100.0) AS INTEGER) "
+        "WHERE price > 0",
+    ]),
+
 ]
 
 

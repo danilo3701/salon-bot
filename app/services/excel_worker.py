@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from app.core.settings import settings
+from app.core.money import format_eur
 
 logger = logging.getLogger("salon.excel")
 
@@ -40,7 +41,7 @@ def _ensure(path: str):
             wb = Workbook()
             ws = wb.active
             ws.title = "Записи"
-            ws.append(["Тип", "Имя", "Телефон", "Услуга", "Дата", "Время", "Цена", "Статус"])
+            ws.append(["Тип", "Имя", "Телефон", "Услуга", "Дата", "Время", "Цена (EUR)", "Статус"])
             wb.save(path)
         except Exception as e:
             logger.error("Excel create: %s", e)
@@ -54,7 +55,7 @@ def _write(path: str, row: ExcelRow):
             wb = load_workbook(path)
             wb.active.append([
                 row.kind, row.name, row.phone, row.service,
-                row.date, row.time, row.price, row.status,
+                row.date, row.time, format_eur(row.price), row.status,
             ])
             wb.save(path)
     except Exception as e:

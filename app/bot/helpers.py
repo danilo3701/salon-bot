@@ -6,6 +6,7 @@ import logging
 from typing import Any, Callable, Coroutine, Optional
 
 from app.core.step_guard import set_step, check_and_reset_if_expired  # noqa: F401
+from app.core.money import format_eur
 
 logger = logging.getLogger("salon.bot")
 
@@ -119,7 +120,7 @@ def fmt_booking(b) -> str:
     from app.core.time_utils import fmt_date, fmt_slot
     icon = {"active": "✅", "cancelled": "❌", "completed": "✔️"}.get(b.status.value, "•")
     return (
-        f"{icon} <b>{b.service}</b> — {b.price:,} руб.\n"
+        f"{icon} <b>{b.service}</b> — {format_eur(b.price)}\n"
         f"📅 {fmt_date(b.date)}  ⏰ {fmt_slot(b.time)}"
     )
 
