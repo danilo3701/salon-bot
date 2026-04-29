@@ -498,6 +498,7 @@ def main():
                 TimeSlotRepo.seed(db2, settings.TIME_SLOTS)
 
     # 3. Синхронизируем settings из БД
+    settings.load_runtime_values()
     ServiceService().sync()
     TimeSlotService().sync()
 

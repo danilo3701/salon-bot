@@ -323,6 +323,15 @@ _MIGRATIONS: list[tuple[int, str, list[str]]] = [
         "INSERT OR IGNORE INTO weekly_day_templates (weekday, is_open) VALUES (1,1),(2,1),(3,1),(4,1),(5,1),(6,1),(7,1)",
     ]),
 
+    (9, "add runtime_settings table", [
+        """CREATE TABLE IF NOT EXISTS runtime_settings (
+            key        TEXT PRIMARY KEY,
+            value      TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL
+                     DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+        )""",
+    ]),
+
 ]
 
 

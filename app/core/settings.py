@@ -32,6 +32,13 @@ def _rate(raw: str) -> tuple[int, int]:
 
 
 class Settings:
+    _RUNTIME_KEY_TO_ATTR: dict[str, str] = {
+        "MASTER_ADDRESS": "MASTER_ADDRESS",
+        "MASTER_CONTACT": "MASTER_CONTACT",
+        "MASTER_BIO": "MASTER_BIO",
+        "MASTER_PHOTO_ID": "MASTER_PHOTO_ID",
+    }
+
     def __init__(self):
         # Core
         self.BOT_TOKEN: str = _req("BOT_TOKEN")
@@ -129,6 +136,26 @@ class Settings:
     def init_dirs(self):
         for d in (self.DATA_DIR, self.LOGS_DIR):
             d.mkdir(parents=True, exist_ok=True)
+
+    def set_runtime_value(self, key: str, value: str):
+        attr = self._RUNTIME_KEY_TO_ATTR.get(key)
+        if not attr:
+            raise KeyError(f"Unsupported runtime setting key: {key}")
+        setattr(self, attr, value)
+        from app.core.database import atomic
+        from app.repositories.repo import RuntimeSettingRepo
+        with atomic() as db:
+            RuntimeSettingRepo.set(db, key, value)
+
+    def load_runtime_values(self):
+        from app.core.database import get_db
+        from app.repositories.repo import RuntimeSettingRepo
+        with get_db() as db:
+            pairs = RuntimeSettingRepo.all(db)
+        for key, value in pairs.items():
+            attr = self._RUNTIME_KEY_TO_ATTR.get(key)
+            if attr:
+                setattr(self, attr, value)
 
 
 @lru_cache(maxsize=1)

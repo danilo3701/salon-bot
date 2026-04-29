@@ -1293,8 +1293,7 @@ async def _step_about_bio(update: Update, context: CallbackContext):
             f"Слишком длинный текст ({len(text)} символов, макс. 800).")
         return
     set_step(context.user_data, None)
-    settings.MASTER_BIO = text
-    settings.update_env_key("MASTER_BIO", text)
+    settings.set_runtime_value("MASTER_BIO", text)
     await update.message.reply_text("✅ Текст «О мастере» обновлён.",
         reply_markup=kb([("◀️ К странице", "adm_about")] + back_master()))
 
@@ -1314,16 +1313,14 @@ async def _step_about_photo(update: Update, context: CallbackContext):
             reply_markup=kb([("◀️ Отмена", "adm_about")]))
         return
     file_id = update.message.photo[-1].file_id
-    settings.MASTER_PHOTO_ID = file_id
-    settings.update_env_key("MASTER_PHOTO_ID", file_id)
+    settings.set_runtime_value("MASTER_PHOTO_ID", file_id)
     await update.message.reply_text("✅ Фото обновлено.",
         reply_markup=kb([("◀️ К странице", "adm_about")] + back_master()))
 
 
 async def adm_about_clear_photo(update: Update, context: CallbackContext):
     await update.callback_query.answer()
-    settings.MASTER_PHOTO_ID = ""
-    settings.update_env_key("MASTER_PHOTO_ID", "")
+    settings.set_runtime_value("MASTER_PHOTO_ID", "")
     await edit_or_reply(update, "🗑 Фото удалено.",
         kb([("◀️ К странице", "adm_about")] + back_master()))
 
@@ -1345,8 +1342,7 @@ async def _step_about_address(update: Update, context: CallbackContext):
         await update.message.reply_text("Слишком длинный адрес (макс. 200 символов).")
         return
     set_step(context.user_data, None)
-    settings.MASTER_ADDRESS = text
-    settings.update_env_key("MASTER_ADDRESS", text)
+    settings.set_runtime_value("MASTER_ADDRESS", text)
     await update.message.reply_text(f"✅ Адрес обновлён:\n{text}",
         reply_markup=kb([("◀️ К странице", "adm_about")] + back_master()))
 
@@ -1369,8 +1365,7 @@ async def _step_about_contact(update: Update, context: CallbackContext):
         await update.message.reply_text("Слишком длинный контакт (макс. 100 символов).")
         return
     set_step(context.user_data, None)
-    settings.MASTER_CONTACT = text
-    settings.update_env_key("MASTER_CONTACT", text)
+    settings.set_runtime_value("MASTER_CONTACT", text)
     await update.message.reply_text(f"✅ Контакт обновлён:\n{text}",
         reply_markup=kb([("◀️ К странице", "adm_about")] + back_master()))
 

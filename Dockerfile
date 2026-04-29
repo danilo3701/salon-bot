@@ -10,7 +10,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Volumes для персистентных данных
-VOLUME ["/app/data", "/app/logs"]
 
 ENV PYTHONUNBUFFERED=1
 

@@ -792,3 +792,28 @@ class PortfolioRepo:
     @staticmethod
     def count(conn) -> int:
         return conn.execute("SELECT COUNT(*) FROM portfolio").fetchone()[0]
+
+
+class RuntimeSettingRepo:
+    """Runtime settings editable from bot UI and persisted in DB."""
+
+    @staticmethod
+    def get(db: sqlite3.Connection, key: str) -> Optional[str]:
+        row = db.execute(
+            "SELECT value FROM runtime_settings WHERE key=?",
+            (key,),
+        ).fetchone()
+        return row["value"] if row else None
+
+    @staticmethod
+    def set(db: sqlite3.Connection, key: str, value: str):
+        db.execute(
+            "INSERT INTO runtime_settings (key, value) VALUES (?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+
+    @staticmethod
+    def all(db: sqlite3.Connection) -> dict[str, str]:
+        rows = db.execute("SELECT key, value FROM runtime_settings").fetchall()
+        return {r["key"]: r["value"] for r in rows}
