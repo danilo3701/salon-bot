@@ -34,6 +34,10 @@ def _rate(raw: str) -> tuple[int, int]:
 class Settings:
     _RUNTIME_KEY_TO_ATTR: dict[str, str] = {
         "MASTER_ADDRESS": "MASTER_ADDRESS",
+        "MASTER_ADDRESS_GOOGLE": "MASTER_ADDRESS_GOOGLE",
+        "MASTER_ADDRESS_APPLE": "MASTER_ADDRESS_APPLE",
+        "MASTER_ADDRESS_PHOTO_ID": "MASTER_ADDRESS_PHOTO_ID",
+        "MASTER_ADDRESS_EXTRA": "MASTER_ADDRESS_EXTRA",
         "MASTER_CONTACT": "MASTER_CONTACT",
         "MASTER_BIO": "MASTER_BIO",
         "MASTER_PHOTO_ID": "MASTER_PHOTO_ID",
@@ -54,6 +58,10 @@ class Settings:
         self.MASTER_ADDRESS:   str = _get("MASTER_ADDRESS",   "Адрес не указан")
         self.MASTER_CONTACT:   str = _get("MASTER_CONTACT",   self.MASTER_USERNAME)
         self.YANDEX_MAPS_URL:  str = _get("YANDEX_MAPS_URL",  "")
+        self.MASTER_ADDRESS_GOOGLE: str = _get("MASTER_ADDRESS_GOOGLE", self.YANDEX_MAPS_URL)
+        self.MASTER_ADDRESS_APPLE: str = _get("MASTER_ADDRESS_APPLE", "")
+        self.MASTER_ADDRESS_PHOTO_ID: str = _get("MASTER_ADDRESS_PHOTO_ID", "")
+        self.MASTER_ADDRESS_EXTRA: str = _get("MASTER_ADDRESS_EXTRA", "")
         self.MASTER_BIO:       str = _get("MASTER_BIO",       "")
         self.MASTER_PHOTO_ID:  str = _get("MASTER_PHOTO_ID",  "")
 

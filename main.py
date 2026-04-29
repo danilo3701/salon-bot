@@ -334,8 +334,9 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(ch.cb_portfolio_nav,  pattern=r"^portfolio_\d+$"))
     app.add_handler(CallbackQueryHandler(ch.cb_portfolio_back, pattern="^portfolio_back$"))
     app.add_handler(CallbackQueryHandler(ch.show_address, pattern="^show_address$"))
+    app.add_handler(CallbackQueryHandler(ch.show_address_photo, pattern="^show_address_photo$"))
     app.add_handler(CallbackQueryHandler(ch.show_contact, pattern="^contact$"))
-    app.add_handler(CallbackQueryHandler(ch.show_about,   pattern="^about$"))
+    app.add_handler(CallbackQueryHandler(ch.show_about_master,   pattern="^(about|show_about_master)$"))
 
     # ════════════════════════════════════════════════════════════════════════
     # КЛИЕНТ — запись
@@ -461,6 +462,15 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(mh.adm_portfolio_delete,      pattern=r"^adm_portfolio_del_(?!yes_)\d+$"))
     app.add_handler(CallbackQueryHandler(mh.adm_portfolio_delete_yes,  pattern=r"^adm_portfolio_del_yes_\d+$"))
     app.add_handler(CallbackQueryHandler(mh.adm_about,                 pattern="^adm_about$"))
+    app.add_handler(CallbackQueryHandler(mh.adm_profile_photo,         pattern="^adm_profile_photo$"))
+    app.add_handler(CallbackQueryHandler(mh.adm_profile_bio,           pattern="^adm_profile_bio$"))
+    app.add_handler(CallbackQueryHandler(mh.adm_profile_contact,       pattern="^adm_profile_contact$"))
+    app.add_handler(CallbackQueryHandler(mh.adm_address_settings,      pattern="^adm_address_settings$"))
+    app.add_handler(CallbackQueryHandler(mh.adm_address_text,          pattern="^adm_address_text$"))
+    app.add_handler(CallbackQueryHandler(mh.adm_address_google,        pattern="^adm_address_google$"))
+    app.add_handler(CallbackQueryHandler(mh.adm_address_apple,         pattern="^adm_address_apple$"))
+    app.add_handler(CallbackQueryHandler(mh.adm_address_photo,         pattern="^adm_address_photo$"))
+    app.add_handler(CallbackQueryHandler(mh.adm_address_extra,         pattern="^adm_address_extra$"))
     app.add_handler(CallbackQueryHandler(mh.adm_about_edit_bio,     pattern="^adm_about_edit_bio$"))
     app.add_handler(CallbackQueryHandler(mh.adm_about_edit_photo,   pattern="^adm_about_edit_photo$"))
     app.add_handler(CallbackQueryHandler(mh.adm_about_clear_photo,  pattern="^adm_about_clear_photo$"))

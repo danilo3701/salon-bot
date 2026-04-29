@@ -70,14 +70,18 @@ def register_steps(dispatcher):
     dispatcher.register("srv_add_price",  _step_srv_add_price)
     dispatcher.register("srv_edit_price", _step_srv_edit_price)
     dispatcher.register("srv_rename",     _step_srv_rename)
-    dispatcher.register("about_bio",      _step_about_bio)
-    dispatcher.register("about_address",  _step_about_address)
-    dispatcher.register("about_contact",  _step_about_contact)
+    dispatcher.register("profile_bio",    _step_profile_bio)
+    dispatcher.register("profile_contact", _step_profile_contact)
+    dispatcher.register("profile_photo",  _step_profile_photo)
+    dispatcher.register("address_text",   _step_address_text)
+    dispatcher.register("address_google", _step_address_google)
+    dispatcher.register("address_apple",  _step_address_apple)
+    dispatcher.register("address_extra",  _step_address_extra)
+    dispatcher.register("address_photo",  _step_address_photo)
     dispatcher.register("slot_add_start", _step_slot_start)
     dispatcher.register("slot_add_end",   _step_slot_end)
     dispatcher.register("ads_add_time_input", _step_ads_add_time_input)
     dispatcher.register("ads_add_period_input", _step_ads_add_period_input)
-    dispatcher.register("about_photo",    _step_about_photo)
     dispatcher.register("portfolio_add",  _step_portfolio_add)
 
 
@@ -188,6 +192,22 @@ def _normalize_period(raw: str) -> tuple[str, str] | None:
     if not start or not end or start >= end:
         return None
     return start, end
+
+
+def _is_filled(value: str) -> str:
+    return "✅ Заполнен" if (value or "").strip() else "❌ Не задан"
+
+
+def _is_photo_filled(value: str) -> str:
+    return "✅ Загружено" if (value or "").strip() else "❌ Не загружено"
+
+
+def _normalize_profile_text(update: Update) -> str:
+    return ((update.message.text or "") if update.message else "").strip()
+
+
+def _save_runtime_text(key: str, value: str):
+    settings.set_runtime_value(key, "" if value.lower() == "удалить" else value)
 
 
 def _is_admin(update: Update) -> bool:
@@ -1662,23 +1682,20 @@ async def adm_slot_delete_yes(update: Update, context: CallbackContext):
 
 async def adm_about(update: Update, context: CallbackContext):
     await update.callback_query.answer()
-    bio          = settings.MASTER_BIO or "(не заполнено)"
-    bio_display  = bio.replace("\\n", "\n")
-    photo_status = "✅ загружено" if settings.MASTER_PHOTO_ID else "❌ не загружено"
-    await edit_or_reply(update,
-        f"👩‍🎨 <b>О мастере</b>\n\n"
-        f"<b>Текст:</b>\n{bio_display}\n\n"
-        f"<b>Фото:</b> {photo_status}\n"
-        f"<b>Адрес:</b> {settings.MASTER_ADDRESS}\n"
-        f"<b>Контакт:</b> {settings.MASTER_CONTACT}",
+    await edit_or_reply(
+        update,
+        "⚙️ <b>Настройки профиля мастера</b>\n\n"
+        "Здесь вы можете изменить информацию, которую видят клиенты.\n"
+        "Нажмите на кнопку, которую хотите обновить:",
         kb([
-            ("✏️ Текст",         "adm_about_edit_bio"),
-            ("📸 Фото",          "adm_about_edit_photo"),
-            ("🗑 Очистить фото", "adm_about_clear_photo"),
-            ("📍 Адрес",         "adm_about_edit_address"),
-            ("📞 Контакт",       "adm_about_edit_contact"),
-            ("◀️ Меню мастера",  "master_menu"),
-        ], cols=2))
+            ("📷 Изменить фото", "adm_profile_photo"),
+            ("✏️ Описание (О себе)", "adm_profile_bio"),
+            ("📍 Управление адресом", "adm_address_settings"),
+            ("📞 Изменить контакт", "adm_profile_contact"),
+            ("👁 Предпросмотр профиля", "show_about_master"),
+            ("◀️ В главное меню", "master_menu"),
+        ], cols=1),
+    )
 
 
 async def adm_about_edit_bio(update: Update, context: CallbackContext):
@@ -1779,6 +1796,281 @@ async def _step_about_contact(update: Update, context: CallbackContext):
 # ════════════════════════════════════════════════════════════════════════════════
 # ПРИГЛАШЕНИЕ
 # ════════════════════════════════════════════════════════════════════════════════
+
+async def adm_profile_photo(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    set_step(context.user_data, "profile_photo")
+    await edit_or_reply(
+        update,
+        "📷 <b>Загрузка фото мастера</b>\n\n"
+        "Отправьте фотографию файлом или картинкой.\n"
+        "Она будет отображаться в разделе \"О мастере\".\n\n"
+        "👇 Жду ваше фото:",
+        kb([("❌ Отмена", "adm_about")]),
+    )
+
+
+async def _step_profile_photo(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    if update.message.text and update.message.text.strip().lower() == "удалить":
+        set_step(context.user_data, None)
+        settings.set_runtime_value("MASTER_PHOTO_ID", "")
+        await update.message.reply_text("✅ Фото профиля удалено.", reply_markup=kb([("◀️ Назад", "adm_about")]))
+        return
+    if not update.message.photo:
+        await update.message.reply_text(
+            "Ожидаю фото. Или напишите <code>удалить</code> для очистки.",
+            parse_mode="HTML",
+            reply_markup=kb([("◀️ Назад", "adm_about")]),
+        )
+        return
+    set_step(context.user_data, None)
+    settings.set_runtime_value("MASTER_PHOTO_ID", update.message.photo[-1].file_id)
+    await update.message.reply_text("✅ Фото профиля обновлено.", reply_markup=kb([("◀️ Назад", "adm_about")]))
+
+
+async def adm_profile_bio(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    set_step(context.user_data, "profile_bio")
+    await edit_or_reply(
+        update,
+        "✏️ <b>Редактирование описания (О себе)</b>\n\n"
+        "Напишите новый текст о себе.\n"
+        "Вы можете использовать жирный, курсив и эмодзи.\n\n"
+        "💡 Примеры оформления:\n"
+        "<code>Привет! Я Анна 💅\n✨ Опыт 5 лет\n🌿 Только эко-материалы\n📍 Центр города</code>\n\n"
+        "<code>Мастер ногтевого сервиса.\nСтерильность 100%.\nРаботаю с 10:00 до 20:00.</code>\n\n"
+        "👇 Напишите ваш текст ниже:",
+        kb([("◀️ Назад", "adm_about")]),
+    )
+
+
+async def _step_profile_bio(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    text_value = _normalize_profile_text(update)
+    if not text_value:
+        await update.message.reply_text("Текст не должен быть пустым.")
+        return
+    set_step(context.user_data, None)
+    _save_runtime_text("MASTER_BIO", text_value)
+    await update.message.reply_text("✅ Описание обновлено.", reply_markup=kb([("◀️ Назад", "adm_about")]))
+
+
+async def adm_profile_contact(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    set_step(context.user_data, "profile_contact")
+    await edit_or_reply(
+        update,
+        "📞 <b>Редактирование контакта</b>\n\n"
+        "Как клиентам связаться с вами?\n"
+        "Это может быть:\n"
+        "• Юзернейм телеграм (@username)\n"
+        "• Номер телефона (+7...)\n"
+        "• Ссылка на WhatsApp\n"
+        "• Или любой другой текст.\n\n"
+        "💡 Примеры:\n"
+        "<code>@nail_master_anna</code>\n"
+        "<code>+7 (999) 000-00-00 (Звонить с 10 до 18)</code>\n"
+        "<code>Пишите сюда или в WhatsApp: wa.me/7999...</code>\n\n"
+        "⚠️ Мы не проверяем формат, просто сохраняем ваш текст как есть.\n\n"
+        "👇 Напишите контакт ниже:",
+        kb([("◀️ Назад", "adm_about")]),
+    )
+
+
+async def _step_profile_contact(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    text_value = _normalize_profile_text(update)
+    if not text_value:
+        await update.message.reply_text("Контакт не должен быть пустым.")
+        return
+    set_step(context.user_data, None)
+    _save_runtime_text("MASTER_CONTACT", text_value)
+    await update.message.reply_text("✅ Контакт обновлен.", reply_markup=kb([("◀️ Назад", "adm_about")]))
+
+
+async def adm_address_settings(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    lines = [
+        "📍 <b>Управление адресом</b>",
+        "",
+        "Текущий статус:",
+        f"• Текст: {_is_filled(settings.MASTER_ADDRESS)}",
+        f"• Google Maps: {_is_filled(settings.MASTER_ADDRESS_GOOGLE)}",
+        f"• Apple Maps: {_is_filled(settings.MASTER_ADDRESS_APPLE)}",
+        f"• Фото схемы: {_is_photo_filled(settings.MASTER_ADDRESS_PHOTO_ID)}",
+        f"• Доп. инфо: {_is_filled(settings.MASTER_ADDRESS_EXTRA)}",
+        "",
+        "Выберите элемент для редактирования:",
+    ]
+    await edit_or_reply(
+        update,
+        "\n".join(lines),
+        kb([
+            ("✏️ Текст адреса", "adm_address_text"),
+            ("🔗 Ссылка Google", "adm_address_google"),
+            ("🔗 Ссылка Apple", "adm_address_apple"),
+            ("📸 Фото схемы", "adm_address_photo"),
+            ("ℹ️ Доп. инфо", "adm_address_extra"),
+            ("👁 Предпросмотр адреса", "show_address"),
+            ("◀️ Назад", "adm_about"),
+        ], cols=2),
+    )
+
+
+async def adm_address_text(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    set_step(context.user_data, "address_text")
+    await edit_or_reply(
+        update,
+        "✏️ <b>Редактирование текста адреса</b>\n\n"
+        "Напишите основной адрес ниже. Это увидит клиент в первую очередь.\n\n"
+        "💡 Примеры оформления:\n"
+        "<code>г. Москва, ул. Ленина, д. 10, оф. 5</code>\n"
+        "<code>Санкт-Петербург, Невский проспект 20\nВход со двора, 3 этаж, код 1234</code>\n"
+        "<code>Казань, Баумана 15\nТЦ 'Столица', 2 этаж, рядом с эскалатором</code>\n\n"
+        "👇 Напишите ваш адрес ниже:",
+        kb([("◀️ Назад", "adm_address_settings")]),
+    )
+
+
+async def _step_address_text(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    text_value = _normalize_profile_text(update)
+    if not text_value:
+        await update.message.reply_text("Адрес не должен быть пустым.")
+        return
+    set_step(context.user_data, None)
+    _save_runtime_text("MASTER_ADDRESS", text_value)
+    await update.message.reply_text("✅ Текст адреса сохранен.", reply_markup=kb([("◀️ Назад", "adm_address_settings")]))
+
+
+async def adm_address_google(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    set_step(context.user_data, "address_google")
+    await edit_or_reply(
+        update,
+        "🗺 <b>Ссылка на Google Maps</b>\n\n"
+        "Отправьте полную ссылку на точку. У клиента она отобразится как кнопка.\n\n"
+        "💡 Как получить ссылку:\n"
+        "<code>Откройте приложение карт.\nНажмите \"Поделиться\" на вашей точке.\nСкопируйте ссылку и отправьте её сюда.</code>\n\n"
+        "💡 Пример ссылки:\n"
+        "<code>https://goo.gl/maps/AbCdEfGhIjKlMnOp</code>\n"
+        "<code>https://www.google.com/maps/place/...</code>\n\n"
+        "👇 Отправьте ссылку ниже:\n"
+        "<blockquote>Напишите \"удалить\", чтобы убрать ссылку</blockquote>",
+        kb([("◀️ Назад", "adm_address_settings")]),
+    )
+
+
+async def _step_address_google(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    text_value = _normalize_profile_text(update)
+    if not text_value:
+        await update.message.reply_text("Введите ссылку или слово удалить.")
+        return
+    set_step(context.user_data, None)
+    _save_runtime_text("MASTER_ADDRESS_GOOGLE", text_value)
+    await update.message.reply_text("✅ Ссылка Google сохранена.", reply_markup=kb([("◀️ Назад", "adm_address_settings")]))
+
+
+async def adm_address_apple(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    set_step(context.user_data, "address_apple")
+    await edit_or_reply(
+        update,
+        "🍏 <b>Ссылка на Apple Карты</b>\n\n"
+        "Отправьте ссылку для пользователей iPhone.\n\n"
+        "💡 Пример ссылки:\n"
+        "<code>https://maps.apple.com/?q=...</code>\n\n"
+        "👇 Отправьте ссылку ниже:\n"
+        "<blockquote>Напишите \"удалить\", чтобы убрать ссылку</blockquote>",
+        kb([("◀️ Назад", "adm_address_settings")]),
+    )
+
+
+async def _step_address_apple(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    text_value = _normalize_profile_text(update)
+    if not text_value:
+        await update.message.reply_text("Введите ссылку или слово удалить.")
+        return
+    set_step(context.user_data, None)
+    _save_runtime_text("MASTER_ADDRESS_APPLE", text_value)
+    await update.message.reply_text("✅ Ссылка Apple сохранена.", reply_markup=kb([("◀️ Назад", "adm_address_settings")]))
+
+
+async def adm_address_photo(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    set_step(context.user_data, "address_photo")
+    await edit_or_reply(
+        update,
+        "📸 <b>Фото схемы проезда</b>\n\n"
+        "Загрузите фото, если вход сложно найти.\n"
+        "Это может быть фото вывески, двери или скриншот карты.\n\n"
+        "💡 Клиент увидит кнопку \"📸 Схема проезда\", при нажатии на которую откроется это фото.\n\n"
+        "👇 Отправьте фото файлом или изображением:\n"
+        "<blockquote>Напишите слово \"удалить\" текстом, чтобы удалить текущее фото</blockquote>",
+        kb([("◀️ Назад", "adm_address_settings")]),
+    )
+
+
+async def _step_address_photo(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    if update.message.text and update.message.text.strip().lower() == "удалить":
+        set_step(context.user_data, None)
+        settings.set_runtime_value("MASTER_ADDRESS_PHOTO_ID", "")
+        await update.message.reply_text("✅ Фото схемы удалено.", reply_markup=kb([("◀️ Назад", "adm_address_settings")]))
+        return
+    if not update.message.photo:
+        await update.message.reply_text(
+            "Ожидаю фото. Или напишите <code>удалить</code> для очистки.",
+            parse_mode="HTML",
+            reply_markup=kb([("◀️ Назад", "adm_address_settings")]),
+        )
+        return
+    set_step(context.user_data, None)
+    settings.set_runtime_value("MASTER_ADDRESS_PHOTO_ID", update.message.photo[-1].file_id)
+    await update.message.reply_text("✅ Фото схемы сохранено.", reply_markup=kb([("◀️ Назад", "adm_address_settings")]))
+
+
+async def adm_address_extra(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    set_step(context.user_data, "address_extra")
+    await edit_or_reply(
+        update,
+        "ℹ️ <b>Дополнительная информация</b>\n\n"
+        "Здесь можно написать важные детали: домофон, парковка, метро.\n"
+        "Отображается мелким текстом под основным адресом.\n\n"
+        "💡 Примеры:\n"
+        "<code>⚠️ Домофон не работает, звоните в дверь!</code>\n"
+        "<code>🅿️ Бесплатная парковка во дворе за шлагбаумом.</code>\n"
+        "<code>🚇 Метро Пушкинская, выход в город последний вагон.</code>\n"
+        "<code>🐕 Можно приходить с собаками небольших пород.</code>\n\n"
+        "👇 Напишите текст ниже:\n"
+        "<blockquote>Напишите \"удалить\", чтобы очистить поле</blockquote>",
+        kb([("◀️ Назад", "adm_address_settings")]),
+    )
+
+
+async def _step_address_extra(update: Update, context: CallbackContext):
+    if not update.message:
+        return
+    text_value = _normalize_profile_text(update)
+    if not text_value:
+        await update.message.reply_text("Введите текст или слово удалить.")
+        return
+    set_step(context.user_data, None)
+    _save_runtime_text("MASTER_ADDRESS_EXTRA", text_value)
+    await update.message.reply_text("✅ Дополнительная информация сохранена.", reply_markup=kb([("◀️ Назад", "adm_address_settings")]))
+
 
 async def adm_invite(update: Update, context: CallbackContext):
     await update.callback_query.answer()

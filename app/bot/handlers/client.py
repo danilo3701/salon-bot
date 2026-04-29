@@ -8,8 +8,9 @@ app/bot/handlers/client.py  — v13
 from __future__ import annotations
 
 import logging
+from html import escape
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackContext
 
 from app.bot.helpers import (
@@ -61,19 +62,34 @@ async def cmd_start(update: Update, context: CallbackContext):
     set_step(context.user_data, None)
 
     buttons  = [
-        ("💅 Записаться",      "book_service"),
-        ("📋 Мои записи",      "my_bookings"),
-        ("📸 Портфолио",       "portfolio"),
-        ("💰 Прайс-лист",      "prices"),
-        ("📍 Адрес",           "show_address"),
-        ("👩‍🎨 О мастере",        "about"),
-        ("📞 Контакт мастера", "contact"),
+        ("\U0001F485 Записаться", "book_service"),
+        ("\U0001F4CB Мои записи", "my_bookings"),
+        ("\U0001F4B0 Прайс-лист", "prices"),
+        ("\U0001F4CD Адрес", "show_address"),
+        ("\U0001F469\u200D\U0001F3A8 О мастере", "show_about_master"),
+        ("\U0001F4F8 Портфолио", "portfolio"),
     ]
 
     client = svc(context, K_CLIENT).get(uid)
     name   = client.display_name if client else first
-    text   = f"Добрый день, {name}! 💅\n\nЧем могу помочь?"
-    markup = kb(buttons, cols=2)
+    studio_name = settings.MASTER_USERNAME.lstrip("@") or name
+    text   = (
+        f'\U0001F485 <b>Студия Маникюра "{escape(studio_name)}"</b>\n'
+        "Добро пожаловать!\n"
+        "Выберите действие в меню ниже:"
+    )
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("\U0001F485 Записаться", callback_data="book_service")],
+        [
+            InlineKeyboardButton("\U0001F4CB Мои записи", callback_data="my_bookings"),
+            InlineKeyboardButton("\U0001F4B0 Прайс-лист", callback_data="prices"),
+        ],
+        [
+            InlineKeyboardButton("\U0001F4CD Адрес", callback_data="show_address"),
+            InlineKeyboardButton("\U0001F469\u200D\U0001F3A8 О мастере", callback_data="show_about_master"),
+        ],
+        [InlineKeyboardButton("\U0001F4F8 Портфолио", callback_data="portfolio")],
+    ])
     # При нажатии кнопки «Назад» — редактируем плавно; при /start — новое сообщение
     if update.callback_query:
         await edit_or_reply(update, text, markup)
@@ -109,43 +125,96 @@ async def show_prices(update: Update, context: CallbackContext):
         kb(back_main()))
 
 
+def _address_client_markup() -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    map_row: list[InlineKeyboardButton] = []
+    if settings.MASTER_ADDRESS_GOOGLE:
+        map_row.append(InlineKeyboardButton("\U0001F5FA Google Maps", url=settings.MASTER_ADDRESS_GOOGLE))
+    if settings.MASTER_ADDRESS_APPLE:
+        map_row.append(InlineKeyboardButton("\U0001F34F Apple Карты", url=settings.MASTER_ADDRESS_APPLE))
+    if map_row:
+        rows.append(map_row)
+    if settings.MASTER_ADDRESS_PHOTO_ID:
+        rows.append([InlineKeyboardButton("\U0001F4F8 Схема проезда", callback_data="show_address_photo")])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="main_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _master_contact_html() -> str:
+    contact = (settings.MASTER_CONTACT or "").strip()
+    if not contact:
+        return "Контакт не указан"
+    if contact.startswith("@"):
+        username = contact.lstrip("@")
+        return f"<a href='https://t.me/{escape(username)}'>{escape(contact)}</a>"
+    if contact.startswith(("http://", "https://", "wa.me/", "t.me/")):
+        href = contact if contact.startswith(("http://", "https://")) else f"https://{contact}"
+        return f"<a href='{escape(href)}'>{escape(contact)}</a>"
+    return escape(contact).replace("\n", "<br>")
+
+
+def _master_contact_button() -> InlineKeyboardButton:
+    contact = (settings.MASTER_CONTACT or "").strip()
+    if contact.startswith("@"):
+        return InlineKeyboardButton("✍️ Написать мастеру", url=f"https://t.me/{contact.lstrip('@')}")
+    if contact.startswith(("http://", "https://", "wa.me/", "t.me/")):
+        href = contact if contact.startswith(("http://", "https://")) else f"https://{contact}"
+        return InlineKeyboardButton("✍️ Написать мастеру", url=href)
+    return InlineKeyboardButton("✍️ Написать мастеру", callback_data="contact")
+
+
 async def show_address(update: Update, context: CallbackContext):
     await update.callback_query.answer()
     set_step(context.user_data, None)
-    text = f"📍 <b>Адрес</b>\n\n{settings.MASTER_ADDRESS}"
-    if settings.YANDEX_MAPS_URL:
-        text += f"\n\n🗺 <a href='{settings.YANDEX_MAPS_URL}'>Открыть в Яндекс.Картах</a>"
-    await edit_or_reply(update, text, kb(back_main()),
-                        disable_web_page_preview=True)
+    lines = [
+        "\U0001F4CD <b>Наш адрес</b>",
+        escape(settings.MASTER_ADDRESS or "Адрес пока не заполнен").replace("\n", "<br>"),
+    ]
+    extra = (settings.MASTER_ADDRESS_EXTRA or "").strip()
+    if extra:
+        lines.append(f"<blockquote>{escape(extra).replace(chr(10), '<br>')}</blockquote>")
+    await edit_or_reply(update, "\n".join(lines), _address_client_markup(), disable_web_page_preview=True)
+
+
+async def show_address_photo(update: Update, context: CallbackContext):
+    await update.callback_query.answer()
+    set_step(context.user_data, None)
+    photo_id = settings.MASTER_ADDRESS_PHOTO_ID
+    if not photo_id:
+        await edit_or_reply(update, "\U0001F4F8 Схема проезда пока не добавлена.", kb(back_main()))
+        return
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="show_address")]])
+    await send_photo_or_edit(update, context, photo_id, "\U0001F4F8 <b>Схема проезда</b>", markup)
 
 
 async def show_contact(update: Update, context: CallbackContext):
     await update.callback_query.answer()
     set_step(context.user_data, None)
-    contact = settings.MASTER_CONTACT
-    if contact.startswith("@"):
-        username     = contact.lstrip("@")
-        contact_line = f"<a href='https://t.me/{username}'>{contact}</a>"
-    else:
-        contact_line = contact
-    await edit_or_reply(update,
-        f"📞 <b>Контакт мастера</b>\n\n"
-        f"{contact_line}\n\n"
-        f"Напишите напрямую, если удобнее не через бота.",
+    await edit_or_reply(
+        update,
+        f"\U0001F4DE <b>Контакт мастера</b>\n\n{_master_contact_html()}",
         kb(back_main()),
-        disable_web_page_preview=True)
+        disable_web_page_preview=True,
+    )
 
 
 async def show_about(update: Update, context: CallbackContext):
     await update.callback_query.answer()
     set_step(context.user_data, None)
+    master_name = settings.MASTER_USERNAME.lstrip("@") or "Мастер"
     bio = settings.MASTER_BIO or (
-        f"Привет! Я {settings.MASTER_USERNAME} — мастер маникюра.\n\n"
-        f"Запишитесь через бота или напишите напрямую."
+        "Привет! Я сертифицированный мастер ногтевого сервиса.\n"
+        "✨ Работаю на качественных материалах.\n"
+        "✨ Соблюдаю стерильность и чистоту.\n"
+        "✨ Помогу подобрать удобную форму и оттенок."
     )
-    bio  = bio.replace("\\n", "\n")
-    text = f"👩‍🎨 <b>О мастере</b>\n\n{bio}"
-    markup = kb(back_main())
+    bio = bio.replace("\\n", "\n")
+    text = f"\U0001F469\u200D\U0001F3A8 <b>Мастер: {escape(master_name)}</b>\n\n{escape(bio).replace(chr(10), '<br>')}"
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("\U0001F4CD Показать адрес", callback_data="show_address")],
+        [_master_contact_button()],
+        [InlineKeyboardButton("◀️ Назад", callback_data="main_menu")],
+    ])
     if settings.MASTER_PHOTO_ID:
         try:
             await send_photo_or_edit(update, context, settings.MASTER_PHOTO_ID, text, markup)
@@ -155,9 +224,9 @@ async def show_about(update: Update, context: CallbackContext):
     await edit_or_reply(update, text, markup)
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# ЗАПИСЬ — ВЫБОР УСЛУГИ
-# ════════════════════════════════════════════════════════════════════════════════
+async def show_about_master(update: Update, context: CallbackContext):
+    await show_about(update, context)
+
 
 async def book_service(update: Update, context: CallbackContext):
     if await _is_banned(update, context):
